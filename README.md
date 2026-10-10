@@ -92,3 +92,9 @@ python ui/floating.py      # 单独预览悬浮窗
 需求、规划、功能、开发四份文档在本地知识库中维护（开发文档含踩坑记录：为什么用 PyQt5 不用 PySide6），未随仓库发布。
 
 关键设计决策同时写在代码注释里，见 `db/models.py`、`services/timer.py`。
+
+---
+
+## 许可证
+
+[MIT](LICENSE) © 2026 lvxiaowu777
