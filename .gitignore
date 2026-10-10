@@ -1,0 +1,27 @@
+# —— 密钥 / 本机配置 ——
+.env
+.env.*
+!.env.example
+
+# —— Python ——
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# —— 打包产物 ——
+build/
+dist/
+*.spec
+
+# —— 编辑器 / 系统 ——
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# —— 日志 / 数据导出 ——
+*.log
+*.sql
+*.sqlite3

@@ -1,0 +1,8 @@
+# GUI —— 用 PyQt5 不是 PySide6：
+# Anaconda 自带的 msvcp140.dll 比系统的新版旧，会顶掉 PySide6 的 Qt6 DLL，
+# 导致「找不到指定的程序」。PyQt5 已随 Anaconda 装好，可用。
+PyQt5>=5.15
+
+SQLAlchemy>=2.0
+PyMySQL>=1.1
+httpx>=0.27
