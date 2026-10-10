@@ -105,7 +105,7 @@ class ReviewDialog(QDialog):
         self.edit.setMinimumHeight(130)
         root.addWidget(self.edit)
 
-        note = QLabel("必须写才能保存 —— AI 会把这段话拆成一条条知识点")
+        note = QLabel("必须写才能保存 —— AI 会把它整理成一段通顺的话，并提炼关键词")
         note.setObjectName("note")
         root.addWidget(note)
 

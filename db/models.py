@@ -102,6 +102,13 @@ class FocusSession(Base):
 
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     raw_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # —— AI 整理后的段落 ——
+    # 归档时由 AI 把 raw_text 整理成通顺的话（见 services/llm.py）。
+    # NULL = 还没整理过（AI 没配 / 调用失败 / 早于本字段的历史记录），
+    # 界面这时回退显示 raw_text 原文。
+    polished_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     status: Mapped[SessionStatus] = mapped_column(
         Enum(SessionStatus, native_enum=True),
         default=SessionStatus.running,
@@ -111,6 +118,7 @@ class FocusSession(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
     category: Mapped["Category"] = relationship(back_populates="sessions")
+    items: Mapped[list["Item"]] = relationship(back_populates="session")
 
     __table_args__ = (
         # ★ 强制回顾的最后一道闸：不写总结，数据库层面就是进不了 completed
@@ -166,19 +174,32 @@ class Setting(Base):
 
 
 class Item(Base):
-    """条目 —— AI 从总结原文里拆出来的一条条知识点，挂在类别下。"""
+    """
+    关键词 —— AI 从某次专注的总结里提炼出来的名词性短语。
+
+    从「挂在类别下的独立清单」改成了「挂在某次专注下的关键词」：
+    看板现在是按段落展示，关键词展示在对应那一段下面（见 ui/dashboard.py）。
+
+    session_id 为 NULL = 早于本字段的历史数据（当时条目只挂类别、没挂某次专注），
+    这些历史关键词不再展示，但数据一条都没删。
+    """
 
     __tablename__ = "item"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     category_id: Mapped[int] = mapped_column(ForeignKey("category.id"), nullable=False)
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), nullable=True
+    )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
     category: Mapped["Category"] = relationship(back_populates="items")
+    session: Mapped["FocusSession | None"] = relationship(back_populates="items")
 
     __table_args__ = (
         Index("idx_item_category", "category_id"),
+        Index("idx_item_session", "session_id"),
     )
 
     def __repr__(self) -> str:

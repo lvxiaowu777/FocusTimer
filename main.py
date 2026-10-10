@@ -38,10 +38,10 @@ from PyQt5.QtWidgets import (
 from config import __version__
 from db.database import SessionLocal, init_db
 from db.models import SessionStatus
+from services import llm as llm_svc
 from services import settings as settings_svc
 from services import sound as sound_svc
 from services import timer as timer_svc
-from services.llm import extract_items
 from ui.dashboard import Dashboard, fmt_hours
 from ui.floating import FloatingTimer
 from ui.review_dialog import ReviewDialog
@@ -140,6 +140,10 @@ class FocusApp:
         # 上一次看到的阶段。None = 还没接上，第一次只记录不响铃。
         self._last_phase: str | None = None
 
+        # 后台整理完成 → 置这个标记，主线程每秒的 tick 里看到就刷新看板。
+        # 不在工作线程里直接调 dashboard.refresh()：Qt 的界面只能在主线程动。
+        self._dashboard_dirty = False
+
         # 每秒刷新倒计时（真实时长由时间戳算，这里只是重绘）
         self.tick = QTimer()
         self.tick.timeout.connect(self.refresh_display)
@@ -215,6 +219,12 @@ class FocusApp:
 
     def refresh_display(self) -> None:
         """每秒刷新 —— 阶段和剩余时间都由「总时长 + 设置」算出来，不用存。"""
+        # 后台整理完成 → 在这一帧刷新看板（界面只能在主线程动，所以走这个标记）
+        if self._dashboard_dirty:
+            self._dashboard_dirty = False
+            if self.dashboard.isVisible():
+                self.dashboard.refresh()
+
         if self.active is None:
             return
 
@@ -240,6 +250,15 @@ class FocusApp:
         self._last_phase = phase
 
         self.win.set_phase(phase, remain, total)
+
+        # —— 暂停中：把两个数推给悬浮窗 ——
+        #   本次 = now − paused_at（这一秒还在涨）
+        #   累计 = 之前几次已经结算掉的 paused_seconds + 本次
+        if self.active.status == SessionStatus.paused and self.active.paused_at is not None:
+            current = max(0, int((datetime.now() - self.active.paused_at).total_seconds()))
+            self.win.set_pause_seconds(
+                current, max(0, int(self.active.paused_seconds or 0)) + current
+            )
 
     def _announce_phase(self, phase: str) -> None:
         """切到新阶段了 —— 响一声。"""
@@ -281,6 +300,7 @@ class FocusApp:
         with SessionLocal() as db:
             self.active = detach(db, timer_svc.pause(db, self.active.id))
         self.win.set_state("paused")
+        self.refresh_display()       # 立刻显示 00:00，别等下一秒的 tick
 
     def on_resume(self) -> None:
         if not self.active:
@@ -288,6 +308,7 @@ class FocusApp:
         with SessionLocal() as db:
             self.active = detach(db, timer_svc.resume(db, self.active.id))
         self.win.set_state("running")
+        self.refresh_display()
 
     def on_skip_break(self) -> None:
         """休息中点「跳过休息」—— 时间线直接跳到下一个专注段开头。"""
@@ -355,9 +376,9 @@ class FocusApp:
             QMessageBox.critical(None, "保存失败", str(e))
             return
 
-        # ★ 总结已经安全落库 —— 下面 AI 拆条目失败也不影响记录
+        # ★ 总结已经安全落库 —— 下面 AI 整理失败也不影响记录
         self.active = None
-        self._extract_in_background(session.category_id, session._category_name, text)
+        self._polish_in_background(session.id, session._category_name, text)
 
         # 顺手重算窗口显示
         with SessionLocal() as db:
@@ -393,19 +414,36 @@ class FocusApp:
             # 反悔了 —— 回到「待写总结」，但不自动重开弹窗（免得成死循环）
             self.win.set_state("pending_review")
 
-    def _extract_in_background(self, category_id: int, category_name: str, text: str) -> None:
-        """AI 拆条目 —— 放后台线程，不卡界面。"""
+    def _polish_in_background(self, session_id: int, category_name: str, text: str) -> None:
+        """
+        AI 把总结整理成段落 —— 放后台线程，不卡界面。
+
+        ⚠️ text 必须由调用方传进来，不能从 session 对象上读 `session.raw_text`：
+           传进来的 session 是**脱管副本**，它的 raw_text 是在 `stop()` 那一刻加载的，
+           那时总结还没提交、值是 None。原实现把 text 当参数传正是这个原因。
+
+        失败不影响记录：原文早就落库了，polished_text 留空，
+        看板会显示原文并打上「未整理」标记，用户可以右键单条重新整理，
+        或用看板右上角的「批量整理」一次性补。
+        """
         import threading
 
+        raw = (text or "").strip()
+        if not raw:
+            return
+
         def work():
-            items = extract_items(text, category_name)     # 失败返回 []
-            if not items:
+            paragraph, keywords = llm_svc.polish(raw, category_name)   # 失败返回 ("", [])
+            if not paragraph:
+                print(f"[ai] id={session_id} 整理失败，保持「未整理」（记录本身已安全保存）")
                 return
             with SessionLocal() as db:
-                created = timer_svc.add_items(db, category_id, items)
-            if created:
-                print(f"[ai] 拆出 {len(created)} 条: {', '.join(i.name for i in created)}")
-                QTimer.singleShot(0, self.dashboard.refresh)
+                created = timer_svc.set_polish(db, session_id, paragraph, keywords)
+            print(
+                f"[ai] id={session_id} 整理完成："
+                f"段落 {len(paragraph)} 字，关键词 {len(created)} 个"
+            )
+            self._dashboard_dirty = True
 
         threading.Thread(target=work, daemon=True).start()
 

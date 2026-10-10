@@ -1,19 +1,28 @@
 """
-看板 —— 左边类别（可增删改、拖动排序），右边该类别下 AI 拆出来的条目。
+看板 —— 左边类别（可增删改、置顶），右边该类别下每次专注的**段落卡片**。
 
-按需求只显示两样：**类别总时间** 和 **条目清单**。
-不显示次数、不显示每次时长。
+右侧从「条目清单」改成了「段落卡片」：
+    以前每次专注被 AI 切碎成一条条短词，挂在类别下平铺展示，叙述本身丢了；
+    现在每次专注是一段完整的话，关键词作为附属信息挂在这一段下面。
+
+每张卡片显示：开始 → 结束时间、专注时长、其中休息时长、整理后的段落、关键词。
+没整理过的（AI 没配 / 调用失败 / 早于 polished_text 字段的历史记录）回退显示原文原文，
+并在角上打一个「未整理」标记。
 """
 from __future__ import annotations
 
+import re
 import sys
+import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -22,11 +31,15 @@ from PyQt5.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from db.database import SessionLocal
+from services import llm as llm_svc
 from services import timer as timer_svc
 
 QSS = """
@@ -50,9 +63,39 @@ QPushButton {
     padding: 5px 12px; font-size: 11px; color: #374151; background: #ffffff;
 }
 QPushButton:hover { background: #f9fafb; border-color: #d1d5db; }
+QPushButton:disabled { color: #c0c4cc; background: #fafafa; }
 QPushButton#primary { background: #3b82f6; color: #fff; border: none; }
 QPushButton#primary:hover { background: #2563eb; }
+QPushButton#link {
+    border: none; background: transparent; color: #3b82f6;
+    font-size: 11px; padding: 0;
+}
+QPushButton#link:hover { color: #2563eb; }
+QScrollArea#scroll { border: none; background: #ffffff; }
+QWidget#cardsHost { background: #ffffff; }
+QFrame#card { background: #fafafa; border: 1px solid #e5e7eb; border-radius: 8px; }
+QLabel#cardWhen { color: #3b82f6; font-size: 11px; font-weight: bold; }
+QLabel#cardStat { color: #6b7280; font-size: 11px; }
+QLabel#cardTag  {
+    color: #b45309; background: #fef3c7;
+    border-radius: 8px; padding: 1px 7px; font-size: 10px;
+}
+QLabel#cardBody { color: #1f2937; font-size: 12px; }
+QLabel#cardKw   { color: #6b7280; font-size: 11px; }
+QTextBrowser#viewer {
+    border: 1px solid #e5e7eb; border-radius: 8px;
+    background: #fafafa; padding: 8px; font-size: 13px; color: #1f2937;
+}
 """
+
+MENU_QSS = (
+    "QMenu{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:4px;}"
+    "QMenu::item{padding:6px 18px;border-radius:5px;font-size:12px;color:#1f2937;}"
+    "QMenu::item:selected{background:#eff6ff;color:#1d4ed8;}"
+)
+
+# 判断段落是不是 Markdown（行首 1~4 个 # + 空格）—— 决定用哪种方式渲染
+_MD_HEADING = re.compile(r"^\s{0,3}#{1,4}\s+\S", re.M)
 
 
 def fmt_hours(seconds: int) -> str:
@@ -60,6 +103,23 @@ def fmt_hours(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60} min"
     return f"{seconds / 3600:.1f} h"
+
+
+def fmt_duration(seconds: int) -> str:
+    """秒 → 「2h43m」/「45m」/「30s」。卡片上的时长用这个，比「2.7 h」看得准。"""
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
+
+
+def fmt_clock(dt) -> str:
+    """datetime → 「10-10 10:46」。"""
+    return dt.strftime("%m-%d %H:%M") if dt else "—"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -72,15 +132,173 @@ def fmt_hours(seconds: int) -> str:
 # ─────────────────────────────────────────────────────────────
 
 
+class ParagraphViewer(QDialog):
+    """
+    长段落的独立查看窗口。
+
+    为什么需要它：库里那份 16767 字的文档，如果直接在卡片里展开，卡片会变成
+    **10229 px 高** —— 在看板的滚动区里翻一万像素没法用，而且是个极重的控件。
+    所以超过阈值的段落改成开一个可缩放的独立窗口，自带滚动条。
+    """
+
+    def __init__(self, rec: dict, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{fmt_clock(rec['start_time'])} 的总结")
+        self.resize(780, 640)
+        self.setStyleSheet(QSS)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+
+        head = QLabel(
+            f"{fmt_clock(rec['start_time'])} → {fmt_clock(rec['end_time'])}"
+            f"　　专注 {fmt_duration(rec['duration_seconds'])}"
+            f" · 休息 {fmt_duration(rec['rest_seconds'])}"
+        )
+        head.setObjectName("cardStat")
+        lay.addWidget(head)
+
+        view = QTextBrowser()
+        view.setObjectName("viewer")
+        view.setOpenExternalLinks(False)
+        text = rec["polished_text"] or rec["raw_text"]
+        if _MD_HEADING.search(text):
+            view.setMarkdown(text)
+        else:
+            view.setPlainText(text)
+        lay.addWidget(view)
+
+        if rec["keywords"]:
+            kw = QLabel("关键词：" + " · ".join(rec["keywords"]))
+            kw.setObjectName("cardKw")
+            kw.setWordWrap(True)
+            lay.addWidget(kw)
+
+        btn = QPushButton("关闭")
+        btn.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(btn)
+        lay.addLayout(row)
+
+
+class RecordCard(QFrame):
+    """
+    一次专注的段落卡片。
+
+    正文过长默认折叠 —— 库里那份 16767 字、30 章节的学习文档全展开会把看板撑爆，
+    所以超过 COLLAPSE_OVER 字先只显示开头的预览，想看全文点「展开全文」。
+    """
+
+    COLLAPSE_OVER = 600
+    PREVIEW_CHARS = 600
+    # 超过这个长度就不在卡片里展开了 —— 展开会得到上万像素高的卡片，没法看
+    INLINE_EXPAND_MAX = 2500
+
+    def __init__(self, rec: dict, on_repolish=None) -> None:
+        super().__init__()
+        self.setObjectName("card")
+        self._rec = rec
+        self._on_repolish = on_repolish
+        self._expanded = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(6)
+
+        # —— 时间行：开始 → 结束 · 专注 · 休息 ——
+        head = QHBoxLayout()
+        head.setSpacing(8)
+
+        when = QLabel(f"{fmt_clock(rec['start_time'])} → {fmt_clock(rec['end_time'])}")
+        when.setObjectName("cardWhen")
+        head.addWidget(when)
+
+        stat = QLabel(
+            f"专注 {fmt_duration(rec['duration_seconds'])}"
+            f" · 休息 {fmt_duration(rec['rest_seconds'])}"
+        )
+        stat.setObjectName("cardStat")
+        head.addWidget(stat)
+
+        if not rec["polished_text"]:
+            tag = QLabel("未整理 · 显示原文")
+            tag.setObjectName("cardTag")
+            head.addWidget(tag)
+
+        head.addStretch()
+        root.addLayout(head)
+
+        # —— 正文 ——
+        self._body_text = rec["polished_text"] or rec["raw_text"]
+        self.body = QLabel()
+        self.body.setObjectName("cardBody")
+        self.body.setWordWrap(True)
+        self.body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        root.addWidget(self.body)
+
+        self._toggle = None
+        self._inline = len(self._body_text) <= self.INLINE_EXPAND_MAX
+        if len(self._body_text) > self.COLLAPSE_OVER:
+            self._toggle = QPushButton(
+                "展开全文" if self._inline else "在新窗口查看全文"
+            )
+            self._toggle.setObjectName("link")
+            self._toggle.setCursor(Qt.PointingHandCursor)
+            self._toggle.clicked.connect(self._toggle_body)
+            root.addWidget(self._toggle, alignment=Qt.AlignLeft)
+
+        self._render_body()
+
+        # —— 关键词 ——
+        if rec["keywords"]:
+            kw = QLabel("关键词：" + " · ".join(rec["keywords"]))
+            kw.setObjectName("cardKw")
+            kw.setWordWrap(True)
+            root.addWidget(kw)
+
+    def _render_body(self) -> None:
+        text = self._body_text
+        if self._toggle is not None and not self._expanded:
+            text = text[: self.PREVIEW_CHARS] + "……"
+        # 带 Markdown 标题的用 Markdown 渲染（标题、加粗能正常显示），
+        # 普通人话用纯文本 —— 免得原文里的 * # 被当成语法吃掉。
+        self.body.setTextFormat(
+            Qt.MarkdownText if _MD_HEADING.search(text) else Qt.PlainText
+        )
+        self.body.setText(text)
+
+    def _toggle_body(self) -> None:
+        # 长文不在卡片里展开，开独立窗口 —— 见 ParagraphViewer 的说明
+        if not self._inline and not self._expanded:
+            ParagraphViewer(self._rec, self).exec_()
+            return
+        self._expanded = not self._expanded
+        self._toggle.setText("收起" if self._expanded else "展开全文")
+        self._render_body()
+
+    def contextMenuEvent(self, event):  # noqa: N802
+        menu = QMenu(self)
+        menu.setStyleSheet(MENU_QSS)
+        menu.addAction("🔄 重新整理这一段", self._repolish)
+        menu.exec_(event.globalPos())
+
+    def _repolish(self) -> None:
+        if self._on_repolish is not None:
+            self._on_repolish(self._rec)
+
+
 class Dashboard(QWidget):
-    """类别总时间 + 条目清单。"""
+    """类别总时间 + 每次专注的段落。"""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("root")
         self.setWindowTitle("学习看板")
         self.setStyleSheet(QSS)
-        self.resize(700, 440)
+        self.resize(880, 560)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 16)
@@ -133,20 +351,53 @@ class Dashboard(QWidget):
         row.addStretch()
         left.addLayout(row)
 
-        cols.addLayout(left, 4)
+        cols.addLayout(left, 3)
 
-        # ───────────── 右：条目 ─────────────
+        # ───────────── 右：段落卡片 ─────────────
         right = QVBoxLayout()
         right.setSpacing(6)
+
+        head2 = QHBoxLayout()
+        head2.setSpacing(8)
         self.items_title = QLabel("学过什么")
         self.items_title.setObjectName("h2")
-        right.addWidget(self.items_title)
+        head2.addWidget(self.items_title)
+        head2.addStretch()
 
-        self.item_list = QListWidget()
-        right.addWidget(self.item_list)
-        cols.addLayout(right, 6)
+        self.btn_polish_all = QPushButton("✨ 批量整理")
+        self.btn_polish_all.setToolTip(
+            "把还没整理过的记录一次性交给 AI 整理。\n"
+            "历史记录和之前调用失败的都算在内。"
+        )
+        self.btn_polish_all.clicked.connect(self._on_polish_all)
+        head2.addWidget(self.btn_polish_all)
+        right.addLayout(head2)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("scroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.cards_host = QWidget()
+        self.cards_host.setObjectName("cardsHost")
+        self.cards_layout = QVBoxLayout(self.cards_host)
+        self.cards_layout.setContentsMargins(0, 0, 6, 0)
+        self.cards_layout.setSpacing(8)
+        self.cards_layout.addStretch()
+        self.scroll.setWidget(self.cards_host)
+
+        right.addWidget(self.scroll)
+        cols.addLayout(right, 7)
 
         root.addLayout(cols)
+
+        # —— 后台整理任务的进度 ——
+        # 用「工作线程写状态 + 主线程定时轮询」而不是 QTimer.singleShot 回推：
+        # 普通 threading.Thread 没有 Qt 事件循环，singleShot 从那边调根本不会触发。
+        self._job = {"running": False, "done": 0, "total": 0, "ok": 0}
+        self._job_timer = QTimer(self)
+        self._job_timer.setInterval(400)
+        self._job_timer.timeout.connect(self._poll_job)
 
         self._categories: list = []
         self.refresh()
@@ -177,7 +428,13 @@ class Dashboard(QWidget):
         with SessionLocal() as db:
             self._categories = timer_svc.category_totals(db)
             today = timer_svc.today_total(db)
+            pending = len(timer_svc.unpolished_records(db))
         self.today_label.setText(f"今日累计 {fmt_hours(today)}")
+
+        self.btn_polish_all.setEnabled(pending > 0 and not self._job["running"])
+        self.btn_polish_all.setText(
+            f"✨ 批量整理 ({pending})" if pending else "✨ 批量整理"
+        )
 
         if select_id is None and self._categories:
             select_id = self._categories[0][0].id
@@ -203,7 +460,7 @@ class Dashboard(QWidget):
         cid = self._current_id()
         if cid is None:
             self.total_label.setText("—")
-            self.item_list.clear()
+            self._clear_cards()
             return
 
         entry = next((c for c in self._categories if c[0].id == cid), None)
@@ -213,19 +470,135 @@ class Dashboard(QWidget):
         self.total_label.setText(f"共 {fmt_hours(total)}")
 
         with SessionLocal() as db:
-            items = timer_svc.category_items(db, cat.id)
+            records = timer_svc.category_records(db, cat.id)
 
-        self.items_title.setText(f"「{cat.name}」学过什么 · {len(items)} 条")
-        self.item_list.clear()
-        if not items:
-            ph = QListWidgetItem("（还没有 —— 写总结后 AI 会自动拆出来）")
-            ph.setFlags(Qt.NoItemFlags)
-            self.item_list.addItem(ph)
+        self.items_title.setText(f"「{cat.name}」· {len(records)} 次专注")
+        self._rebuild_cards(records)
+
+    # ────────────────────────── 段落卡片 ──────────────────────────
+
+    def _clear_cards(self) -> None:
+        """
+        清空卡片区。
+
+        ★ 必须先 setParent(None) 再 deleteLater()：
+          takeAt() 只是把控件从**布局**里摘掉，它仍然是 cards_host 的**子控件**、
+            仍然是可见的 —— 只有等 Qt 处理 DeferredDelete 事件才真正消失。
+            中间这段时间就会看到「上一个类别的卡片残影」叠在新卡片下面。
+            setParent(None) 会立刻断开父子关系（连带隐藏），deleteLater() 再回收内存。
+        """
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+
+    def _rebuild_cards(self, records: list[dict]) -> None:
+        self._clear_cards()
+
+        if not records:
+            ph = QLabel("（还没有记录 —— 完成一次专注并写完总结就会出现在这里）")
+            ph.setObjectName("h2")
+            ph.setWordWrap(True)
+            self.cards_layout.addWidget(ph)
+            self.cards_layout.addStretch()
             return
-        for it in items:
-            self.item_list.addItem(QListWidgetItem("· " + it.name))
 
-    # ────────────────────────── 拖动排序 ──────────────────────────
+        for rec in records:
+            self.cards_layout.addWidget(RecordCard(rec, on_repolish=self._repolish_one))
+        self.cards_layout.addStretch()
+        self.scroll.verticalScrollBar().setValue(0)
+
+    # ────────────────────────── 后台整理 ──────────────────────────
+
+    def _start_job(self, records: list[dict], verb: str) -> None:
+        """把一批记录丢给后台线程整理。同一时刻只允许一个任务。"""
+        if self._job["running"] or not records:
+            return
+
+        total = len(records)
+        self._job = {"running": True, "done": 0, "total": total, "ok": 0}
+        self.btn_polish_all.setEnabled(False)
+        self.btn_polish_all.setText(f"整理中 0/{total}")
+        self._job_timer.start()
+
+        job = self._job
+
+        def work():
+            for rec in records:
+                paragraph, keywords = llm_svc.polish(rec["raw_text"], rec["category_name"])
+                if paragraph:
+                    try:
+                        with SessionLocal() as db:
+                            timer_svc.set_polish(db, rec["id"], paragraph, keywords)
+                        job["ok"] += 1
+                    except Exception as e:              # noqa: BLE001
+                        print(f"[看板] 写入整理结果失败 id={rec['id']}: {e}")
+                job["done"] += 1
+            job["running"] = False
+
+        threading.Thread(target=work, daemon=True).start()
+        print(f"[看板] {verb}：共 {total} 条，后台开始")
+
+    def _poll_job(self) -> None:
+        job = self._job
+        if job["running"]:
+            self.btn_polish_all.setText(f"整理中 {job['done']}/{job['total']}")
+            return
+
+        self._job_timer.stop()
+        ok, total = job["ok"], job["total"]
+        self.btn_polish_all.setText("✨ 批量整理")
+
+        if ok == 0:
+            QMessageBox.warning(
+                self, "整理没成功",
+                f"{total} 条都没整理成功。\n\n"
+                "常见原因：后台没有配 AI（DEEPSEEK_API_KEY），或者网络/接口报错。\n"
+                "详细原因看控制台输出。",
+            )
+        elif ok < total:
+            QMessageBox.information(
+                self, "部分完成",
+                f"成功 {ok} 条，失败 {total - ok} 条。失败的多半是接口超时或输出被截断。",
+            )
+        self.refresh(select_id=self._current_id())
+
+    def _on_polish_all(self) -> None:
+        with SessionLocal() as db:
+            pending = timer_svc.unpolished_records(db)
+        if not pending:
+            QMessageBox.information(self, "都整理过了", "没有需要整理的记录。")
+            return
+
+        chars = sum(len(p["raw_text"]) for p in pending)
+        box = QMessageBox(self)
+        box.setWindowTitle("批量整理")
+        box.setText(
+            f"有 {len(pending)} 条记录还没整理，合计 {chars} 字。\n\n"
+            f"会逐条调用 AI 整理，时间取决于原文长度（最长的一条可能要几分钟）。\n"
+            f"期间看板可以正常用，进度显示在右上角按钮上。\n\n要开始吗？"
+        )
+        box.setIcon(QMessageBox.Question)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box.setDefaultButton(QMessageBox.Yes)
+        if box.exec_() != QMessageBox.Yes:
+            return
+
+        self._start_job(pending, "批量整理")
+
+    def _repolish_one(self, rec: dict) -> None:
+        """重新整理某一段（右键卡片）。"""
+        if self._job["running"]:
+            QMessageBox.information(self, "正在忙", "上一个整理任务还没跑完，稍等一下。")
+            return
+        if not rec["raw_text"].strip():
+            QMessageBox.warning(self, "没有原文", "这条记录没有原文，整理不了。")
+            return
+        self._start_job([rec], f"重新整理 id={rec['id']}")
+
+    # ────────────────────────── 置顶 ──────────────────────────
 
     def _on_toggle_pin(self) -> None:
         """置顶 / 取消置顶当前选中的类别。"""
@@ -266,7 +639,7 @@ class Dashboard(QWidget):
         if n_sessions:
             msg = (
                 f"「{cat.name}」有 {n_sessions} 条学习记录，共 {fmt_hours(seconds)}。\n\n"
-                f"删除会把这些记录和 AI 拆出来的条目**一并清掉**，且无法恢复。\n\n"
+                f"删除会把这些记录和 AI 整理出来的段落、关键词**一并清掉**，且无法恢复。\n\n"
                 f"确定要删吗？"
             )
         else:
@@ -320,11 +693,7 @@ class Dashboard(QWidget):
         pinned = entry[0].is_pinned if entry else False
 
         menu = QMenu(self)
-        menu.setStyleSheet(
-            "QMenu{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:4px;}"
-            "QMenu::item{padding:6px 18px;border-radius:5px;font-size:12px;color:#1f2937;}"
-            "QMenu::item:selected{background:#eff6ff;color:#1d4ed8;}"
-        )
+        menu.setStyleSheet(MENU_QSS)
         menu.addAction("取消置顶" if pinned else "📌 置顶", self._on_toggle_pin)
         menu.addSeparator()
         menu.addAction("重命名", self._on_rename)

@@ -36,11 +36,19 @@ BG          = QColor(255, 255, 255, 236)   # 白底，微透
 BORDER      = QColor(0, 0, 0, 26)          # 淡描边
 TEXT_MAIN   = QColor(31, 41, 55)           # 深灰，数字
 TEXT_SUB    = QColor(107, 114, 128)        # 次级文字
-TEXT_DIM    = QColor(156, 163, 175)        # 暂停时的灰
 ACCENT      = QColor(59, 130, 246)         # 蓝，专注进度弧
 ACCENT_DIM  = QColor(191, 219, 254)        # 淡蓝，弧底
 BREAK       = QColor(34, 197, 94)          # 绿，休息进度弧
 BREAK_DIM   = QColor(187, 247, 208)        # 淡绿，休息弧底
+PAUSE       = QColor(217, 119, 6)          # 琥珀，暂停计时
+
+
+def _fmt_dur(seconds: int) -> str:
+    """秒 → 「MM:SS」，过 1 小时变「H:MM:SS」。"""
+    t = max(0, int(seconds))
+    h, rem = divmod(t, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else "%02d:%02d" % (m, s)
 
 
 class FloatingTimer(QWidget):
@@ -84,6 +92,8 @@ class FloatingTimer(QWidget):
         self.phase_total = 25 * 60         # 本阶段总共多少秒
         self._elapsed = 0                  # 已专注总秒数（给提示用）
         self._study = 0                    # 写总结时显示：已计入的学习时长
+        self._pause_current = 0            # 暂停中显示：本次已暂停多久
+        self._pause_total = 0              # 暂停中显示：这段专注累计暂停多久
         self._drag_offset = None           # QPoint | None
         self._drag_start = None            # 用来区分「点击」和「拖动」
         self._suppress_click = False       # 双击之后那次「抬起」要吞掉
@@ -142,6 +152,20 @@ class FloatingTimer(QWidget):
         self._study = max(0, seconds)
         self.update()
 
+    def set_pause_seconds(self, current: int, total: int) -> None:
+        """
+        暂停期间的两个数：
+
+        current —— **本次**暂停已经持续多久（大数字，一眼看出停了多久）
+        total   —— 这段专注**累计**暂停多久（下方小字）
+
+        为什么要分两个：本次是「现在停了多久」，累计是「这一轮总共被打断多久」。
+        只看本次的话，反复暂停几次会感觉不到整体被打断了多少。
+        """
+        self._pause_current = max(0, int(current))
+        self._pause_total = max(0, int(total))
+        self.update()
+
     def _sync_skip_button(self) -> None:
         """只有「正在休息」才让这个按钮露脸；暂停中不给跳（先继续再说）。"""
         self.btn_skip.setVisible(self.state == "running" and self.phase == "break")
@@ -159,10 +183,7 @@ class FloatingTimer(QWidget):
 
     def _fmt_study(self) -> str:
         """学习时长：不到 1 小时 MM:SS，过了 1 小时 H:MM:SS。"""
-        t = int(self._study)
-        h, rem = divmod(t, 3600)
-        m, s = divmod(rem, 60)
-        return f"{h}:{m:02d}:{s:02d}" if h else "%02d:%02d" % (m, s)
+        return _fmt_dur(self._study)
 
     def _accent(self) -> tuple[QColor, QColor]:
         """(进度弧颜色, 弧底颜色) —— 专注蓝，休息绿。"""
@@ -176,6 +197,15 @@ class FloatingTimer(QWidget):
 
         pad = 6
         rect = QRectF(pad, pad, self.width() - pad * 2, self.height() - pad * 2)
+
+        # 文字分三层，按窗口高度的比例定位。
+        # ★ 不能用 rect.adjusted(...) 上下加减来分层 —— 三条都从同一个 rect 推，
+        #   主数字的底（约 y=84）会跟提示行的顶（约 y=68）压在一起。
+        #   截图验证时亲眼看到「03:07」和下面的小字叠字，所以改成三条互不相交的带。
+        w, h = float(self.width()), float(self.height())
+        band_main = QRectF(0, h * 0.16, w, h * 0.32)   # 主数字
+        band_sub = QRectF(0, h * 0.58, w, h * 0.15)    # 副标题（阶段 · 类别）
+        band_tip = QRectF(0, h * 0.74, w, h * 0.16)    # 状态提示
 
         # —— 底盘：圆角 + 淡边 ——
         path = QPainterPath()
@@ -192,19 +222,16 @@ class FloatingTimer(QWidget):
             f.setBold(True)
             p.setFont(f)
             p.setPen(ACCENT)
-            p.drawText(rect.adjusted(0, -14, 0, -14), Qt.AlignCenter, self._fmt_study())
+            p.drawText(band_main, Qt.AlignCenter, self._fmt_study())
 
             f2 = QFont("Microsoft YaHei UI")
             f2.setPixelSize(10)
             p.setFont(f2)
             p.setPen(TEXT_SUB)
-            p.drawText(
-                rect.adjusted(0, 34, 0, 12), Qt.AlignCenter,
-                "总结中 · %s" % self.category_name,
-            )
+            p.drawText(band_sub, Qt.AlignCenter, "总结中 · %s" % self.category_name)
 
             p.setPen(ACCENT)
-            p.drawText(rect.adjusted(0, 62, 0, 0), Qt.AlignHCenter | Qt.AlignTop, "计时继续")
+            p.drawText(band_tip, Qt.AlignCenter, "计时继续")
             p.end()
             return
 
@@ -232,35 +259,51 @@ class FloatingTimer(QWidget):
             p.drawArc(arc_rect, 90 * 16, -int(360 * 16 * ratio))
 
         # —— 主数字 ——
+        # 暂停时换成「**本次**暂停已持续多久」，一秒一秒往上走 —— 一眼看出停了多久。
+        # （这段专注累计暂停了多少在下面的小字里，两个数并存）
+        if self.state == "paused":
+            main = _fmt_dur(self._pause_current)
+            size = 24 if self._pause_current >= 3600 else 30
+            color = PAUSE
+        else:
+            main = self._fmt()
+            size = 30
+            color = TEXT_MAIN
         f = QFont("Consolas")
-        f.setPixelSize(30)
+        f.setPixelSize(size)
         f.setBold(True)
         p.setFont(f)
-        p.setPen(TEXT_DIM if self.state == "paused" else TEXT_MAIN)
-        p.drawText(rect.adjusted(0, -14, 0, -14), Qt.AlignCenter, self._fmt())
+        p.setPen(color)
+        p.drawText(band_main, Qt.AlignCenter, main)
 
         # —— 副标题：阶段 · 类别 ——
         f2 = QFont("Microsoft YaHei UI")
         f2.setPixelSize(10)
         p.setFont(f2)
         p.setPen(TEXT_SUB)
-        if self.state in ("running", "paused"):
+        if self.state == "paused":
+            sub = "已暂停 · %s" % self.category_name
+        elif self.state == "running":
             head = "休息" if self.phase == "break" else "专注"
             sub = "%s · %s" % (head, self.category_name)
         else:
             sub = "%s · %gh" % (self.category_name, self.total_hours)
-        p.drawText(rect.adjusted(0, 34, 0, 12), Qt.AlignCenter, sub)
+        p.drawText(band_sub, Qt.AlignCenter, sub)
 
         # —— 状态提示 ——
         f3 = QFont("Microsoft YaHei UI")
         f3.setPixelSize(10)
         p.setFont(f3)
         # pending_review 在上面就 return 了，到不了这儿
-        hint = {"idle": ("点击开始", TEXT_SUB),
-                "paused": ("已暂停", TEXT_SUB)}.get(self.state)
-        if hint:
-            p.setPen(hint[1])
-            p.drawText(rect.adjusted(0, 62, 0, 0), Qt.AlignHCenter | Qt.AlignTop, hint[0])
+        if self.state == "paused":
+            tip = "本次累计暂停 %s" % _fmt_dur(self._pause_total)
+        elif self.state == "idle":
+            tip = "点击开始"
+        else:
+            tip = None
+        if tip:
+            p.setPen(TEXT_SUB)
+            p.drawText(band_tip, Qt.AlignCenter, tip)
 
         p.end()
 
@@ -366,6 +409,28 @@ def _preview() -> None:
     w.paused.connect(lambda: w.set_state("paused"))
     w.resumed.connect(lambda: w.set_state("running"))
     w.stop_requested.connect(lambda: w.set_state("pending_review"))
+
+    # 暂停计时预览：暂停时大数字往上走，小字显示累计
+    pause_start = {"t": None}
+
+    def on_pause():
+        w.set_state("paused")
+        pause_start["t"] = datetime.now()
+
+    def on_resume():
+        pause_start["t"] = None
+        w.set_state("running")
+
+    def tick_pause():
+        if pause_start["t"] is not None:
+            cur = int((datetime.now() - pause_start["t"]).total_seconds())
+            w.set_pause_seconds(cur, cur)
+
+    w.paused.connect(on_pause)
+    w.resumed.connect(on_resume)
+    tp = QTimer()
+    tp.timeout.connect(tick_pause)
+    tp.start(1000)
 
     w.show()
     print("预览已启动 —— 单击开始/暂停，右键出菜单")

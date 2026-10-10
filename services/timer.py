@@ -70,6 +70,33 @@ def is_break_now(
     return phase, remain
 
 
+def rest_seconds(session: FocusSession) -> int:
+    """
+    这段专注里**落在休息段的秒数** —— 纯派生，不存库、不查库。
+
+    怎么来的（和 study_seconds 的算法严丝合缝）：
+
+        study_seconds 定死时长那一刻算的是
+            study = (when − start_time) − paused_seconds − rested
+        而 when 就是 end_time，所以反推：
+            rested = (end_time − start_time) − paused_seconds − duration_seconds
+
+    ★ 为什么不在 settle 的时候顺手存一列：
+      duration_seconds 是**当时按当时的设置**定死的。如果休息时长现算，
+      用户以后把「专注 25 分 / 休息 5 分」改成别的，所有历史记录的休息时间
+      会跟着一起变 —— 那是篡改历史。而上面这个式子只用已经定死的数，
+      算出来永远一致。顺带好处：17 条早于本次改动的历史记录也能直接算出休息时间。
+
+    没结束（end_time / duration_seconds 为空）就返回 0。
+    """
+    if session.end_time is None or session.duration_seconds is None:
+        return 0
+
+    span = (session.end_time - session.start_time).total_seconds()
+    rest = span - max(0, int(session.paused_seconds or 0)) - int(session.duration_seconds)
+    return max(0, int(rest))
+
+
 def today_total(db: Session) -> int:
     """
     今天写完总结的学习秒数 —— 看板头部那个「今日累计」。
@@ -210,17 +237,6 @@ def category_totals(db: Session) -> list[tuple[Category, int]]:
         .order_by(Category.is_pinned.desc(), Category.sort_order, Category.id)
     ).all()
     return [(cat, int(total)) for cat, total in rows]
-
-
-def category_items(db: Session, category_id: int) -> list[Item]:
-    """某个类别下 AI 拆出来的条目，新的在前。"""
-    return list(
-        db.scalars(
-            select(Item)
-            .where(Item.category_id == category_id)
-            .order_by(Item.created_at.desc(), Item.id.desc())
-        )
-    )
 
 
 # ────────────────────────── 专注记录 ──────────────────────────
@@ -439,19 +455,117 @@ def get_pending_review(db: Session) -> FocusSession | None:
     ).first()
 
 
-# ────────────────────────── 条目 ──────────────────────────
+# ────────────────────────── AI 整理结果 ──────────────────────────
 
-def add_items(db: Session, category_id: int, names: list[str]) -> list[Item]:
-    """批量写入条目，同类别下去重（AI 重复拆出同一个词不重复入库）。"""
-    existing = {i.name for i in category_items(db, category_id)}
+def set_polish(
+    db: Session, session_id: int, paragraph: str, keywords: list[str]
+) -> list[Item]:
+    """
+    把 AI 的整理结果写回库：段落存 session，关键词存 item（挂到这次专注上）。
+
+    重复整理（看板上的「重新整理」）会**先清掉上次的关键词**再写新的 ——
+    否则点两次就变成两套关键词叠在一起。
+    """
+    s = db.get(FocusSession, session_id)
+    if s is None:
+        raise ValueError("记录不存在")
+
+    text = (paragraph or "").strip()
+    if not text:
+        return []
+
+    s.polished_text = text
+
+    db.query(Item).filter(Item.session_id == s.id).delete()
+
     created = []
-    for raw in names:
+    for raw in keywords:
         name = (raw or "").strip()
-        if not name or name in existing:
+        if not name:
             continue
-        item = Item(category_id=category_id, name=name[:200])
+        item = Item(category_id=s.category_id, session_id=s.id, name=name[:200])
         db.add(item)
-        existing.add(name)
         created.append(item)
+
     db.commit()
     return created
+
+
+def category_records(db: Session, category_id: int, limit: int = 200) -> list[dict]:
+    """
+    某类别下写完总结的记录 —— 看板右侧渲染段落卡片用。
+
+    返回**纯数据**而不是 ORM 对象：卡片要在 Session 关闭之后继续用，
+    而脱管对象一碰关联属性就炸（DetachedInstanceError，见 main.detach 的说明）。
+    两次查询拿完（记录 + 关键词），不做 N+1。
+
+    没整理过的记录 polished_text 是 None，界面上回退显示 raw_text 原文。
+
+    limit: 只取最近这么多条 —— 卡片是真实 widget，几千条会把界面拖死。
+    """
+    sessions = list(
+        db.scalars(
+            select(FocusSession)
+            .where(
+                FocusSession.category_id == category_id,
+                FocusSession.status == SessionStatus.completed,
+            )
+            .order_by(FocusSession.start_time.desc(), FocusSession.id.desc())
+            .limit(limit)
+        )
+    )
+    if not sessions:
+        return []
+
+    by_session: dict[int, list[str]] = {s.id: [] for s in sessions}
+    for item in db.scalars(
+        select(Item).where(Item.session_id.in_(list(by_session))).order_by(Item.id)
+    ):
+        by_session[item.session_id].append(item.name)
+
+    return [
+        {
+            "id": s.id,
+            "start_time": s.start_time,
+            "end_time": s.end_time,
+            "duration_seconds": s.duration_seconds or 0,
+            "rest_seconds": rest_seconds(s),
+            "polished_text": s.polished_text,
+            "raw_text": s.raw_text or "",
+            "keywords": by_session.get(s.id, []),
+        }
+        for s in sessions
+    ]
+
+
+def unpolished_records(db: Session) -> list[dict]:
+    """
+    还没整理过的记录 —— 看板「批量整理」用。
+
+    两类都算：早于 polished_text 字段的历史记录，以及当时 AI 调用失败的。
+    """
+    rows = db.execute(
+        select(
+            FocusSession.id,
+            FocusSession.category_id,
+            FocusSession.raw_text,
+            Category.name,
+        )
+        .join(Category, Category.id == FocusSession.category_id)
+        .where(
+            FocusSession.status == SessionStatus.completed,
+            FocusSession.polished_text.is_(None),
+        )
+        .order_by(FocusSession.start_time)
+    ).all()
+
+    return [
+        {
+            "id": r[0],
+            "category_id": r[1],
+            "raw_text": r[2] or "",
+            "category_name": r[3],
+        }
+        for r in rows
+        if (r[2] or "").strip()
+    ]

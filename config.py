@@ -21,7 +21,7 @@ os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 # —— 版本号 ——
 # 语义化版本 MAJOR.MINOR.PATCH：加功能升 MINOR，修 bug 升 PATCH。
 # 打包成 exe 后靠它分辨新旧，也在「设置」窗口里显示。
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包后：__file__ 指向临时解压目录，
@@ -55,10 +55,12 @@ _load_env(CENTRAL_ENV)
 # —— 数据库 ——
 DATABASE_URL: str = os.environ.get("FOCUS_DATABASE_URL", "")
 
-# —— DeepSeek（拆条目用）——
+# —— DeepSeek（整理总结用）——
 DEEPSEEK_API_KEY: str = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL: str = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL: str = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+# 注意：产品名「DeepSeek-V4.1-Flash」不是 API 参数，模型名是 deepseek-flash。
+# 旧默认值 deepseek-chat 是 V3 系列的模型，已换掉。
+DEEPSEEK_MODEL: str = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 
 # —— 资源目录 ——
 # 打包后 = exe 所在目录，和 .env 同一套逻辑：

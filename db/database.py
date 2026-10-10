@@ -49,16 +49,39 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
          "ALTER TABLE session ADD COLUMN skipped_seconds INT NOT NULL DEFAULT 0"),
         ("review_started_at",
          "ALTER TABLE session ADD COLUMN review_started_at DATETIME NULL"),
+        ("polished_text",
+         "ALTER TABLE session ADD COLUMN polished_text TEXT NULL"),
+    ],
+    "item": [
+        ("session_id",
+         "ALTER TABLE item ADD COLUMN session_id INT NULL"),
+    ],
+}
+
+# 表名 → [(索引名, 建索引 SQL), ...]
+_INDEXES: dict[str, list[tuple[str, str]]] = {
+    "item": [
+        ("idx_item_session",
+         "CREATE INDEX idx_item_session ON item (session_id)"),
+    ],
+}
+
+# 表名 → [(外键名, 建外键 SQL), ...]
+_FKS: dict[str, list[tuple[str, str]]] = {
+    "item": [
+        ("fk_item_session",
+         "ALTER TABLE item ADD CONSTRAINT fk_item_session "
+         "FOREIGN KEY (session_id) REFERENCES `session`(id) ON DELETE CASCADE"),
     ],
 }
 
 
 def _migrate() -> None:
     """
-    给**已存在**的表补新列。
+    给**已存在**的表补新列 / 新索引 / 新外键。
 
     create_all() 只建缺失的表，不会改已有表的结构 —— 所以加字段必须手写迁移。
-    这里的写法是幂等的：列已存在就跳过。
+    这里的写法是幂等的：列（索引、外键）已存在就跳过。
     """
     existing_tables = set(inspect(engine).get_table_names())
 
@@ -72,6 +95,29 @@ def _migrate() -> None:
             with engine.begin() as conn:
                 conn.execute(text(ddl))
             print(f"[db] 迁移：{table} 表已补上 {name} 列")
+
+    for table, indexes in _INDEXES.items():
+        if table not in existing_tables:
+            continue
+        have = {i["name"] for i in inspect(engine).get_indexes(table)}
+        for name, ddl in indexes:
+            if name in have:
+                continue
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
+            print(f"[db] 迁移：{table} 表已补上 {name} 索引")
+
+    for table, fks in _FKS.items():
+        if table not in existing_tables:
+            continue
+        # 外键可能是建表时就带的（名字拿得到），也可能是迁移加的 —— 两种都算「已存在」
+        have = {fk["name"] for fk in inspect(engine).get_foreign_keys(table)}
+        for name, ddl in fks:
+            if name in have:
+                continue
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
+            print(f"[db] 迁移：{table} 表已补上 {name} 外键")
 
 
 def init_db() -> None:
