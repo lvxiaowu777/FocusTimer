@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -29,9 +30,9 @@ from PyQt5.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
 )
 
@@ -70,20 +71,27 @@ def detach(db, session):
 # ────────────────────────── 选类别 ──────────────────────────
 
 class CategoryPicker(QDialog):
-    """开始前选一个类别。1 秒的事。"""
+    """开始前选一个类别。1 秒的事。
+
+    类别有二级目录，所以这里显示成树：
+      · 父类别是**分组**，只能展开看，不能选（它的时长是子类别的合计）
+      · 只有叶子（没有子类别的）才点得动
+    """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("学哪个方向？")
-        self.setMinimumWidth(260)
+        self.setMinimumWidth(340)
+        self.resize(380, 440)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self.setStyleSheet("""
             QDialog { background:#fff; }
             QLabel { color:#6b7280; font-size:12px; }
-            QListWidget { border:1px solid #e5e7eb; border-radius:8px; font-size:13px;
-                          color:#1f2937; outline:none; padding:4px; }
-            QListWidget::item { padding:9px 10px; border-radius:6px; }
-            QListWidget::item:selected { background:#eff6ff; color:#1d4ed8; }
+            QTreeWidget { border:1px solid #e5e7eb; border-radius:8px; font-size:13px;
+                          color:#1f2937; outline:none; padding:4px; background:#fff; }
+            QTreeWidget::item { padding:9px 4px; border-radius:6px; min-height:18px; }
+            QTreeWidget::item:selected { background:#eff6ff; color:#1d4ed8; }
+            QTreeWidget::branch { background:transparent; }
         """)
 
         layout = QVBoxLayout(self)
@@ -92,16 +100,47 @@ class CategoryPicker(QDialog):
 
         layout.addWidget(QLabel("选一个类别，开始计时"))
 
-        self.list = QListWidget()
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setColumnCount(1)
+        self.tree.setIndentation(16)
+        self.tree.setExpandsOnDoubleClick(False)
+        self.tree.setMinimumHeight(260)
+
         with SessionLocal() as db:
-            self._cats = timer_svc.category_totals(db)
-        for cat, total in self._cats:
-            item = QListWidgetItem(f"{cat.name}    ·    {fmt_hours(total)}")
-            item.setData(Qt.UserRole, cat.id)
-            self.list.addItem(item)
-        self.list.setCurrentRow(0)
-        self.list.itemDoubleClicked.connect(lambda _: self.accept())
-        layout.addWidget(self.list)
+            self._tree = timer_svc.category_tree(db)
+
+        first_leaf: QTreeWidgetItem | None = None
+        for node in self._tree:
+            cat, total = node["cat"], node["total"]
+            kids = node["children"]
+
+            if kids:
+                # 分组：不可选
+                group = QTreeWidgetItem([f"{cat.name}    ·    {fmt_hours(total)}"])
+                group.setFlags(Qt.ItemIsEnabled)          # 没有 ItemIsSelectable
+                group.setToolTip(0, "这是分组，不能直接计时 —— 请选它下面的子类别")
+                self.tree.addTopLevelItem(group)
+                for ch in kids:
+                    sub = QTreeWidgetItem(
+                        [f"{ch['cat'].name}    ·    {fmt_hours(ch['total'])}"]
+                    )
+                    sub.setData(0, Qt.UserRole, ch["cat"].id)
+                    group.addChild(sub)
+                    if first_leaf is None:
+                        first_leaf = sub
+                group.setExpanded(True)
+            else:
+                leaf = QTreeWidgetItem([f"{cat.name}    ·    {fmt_hours(total)}"])
+                leaf.setData(0, Qt.UserRole, cat.id)
+                self.tree.addTopLevelItem(leaf)
+                if first_leaf is None:
+                    first_leaf = leaf
+
+        if first_leaf is not None:
+            self.tree.setCurrentItem(first_leaf)
+        self.tree.itemDoubleClicked.connect(self._on_double_clicked)
+        layout.addWidget(self.tree)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("开始")
@@ -110,9 +149,19 @@ class CategoryPicker(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def _on_double_clicked(self, item, _column) -> None:
+        # 双击分组 = 展开/折叠；双击叶子 = 直接开始
+        if item.childCount():
+            item.setExpanded(not item.isExpanded())
+            return
+        if item.data(0, Qt.UserRole) is not None:
+            self.accept()
+
     def selected_id(self) -> int | None:
-        item = self.list.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        return item.data(0, Qt.UserRole)     # 分组没有这个数据 → None
 
 
 # ────────────────────────── 主应用 ──────────────────────────
@@ -286,6 +335,11 @@ class FocusApp:
             return
         cid = picker.selected_id()
         if cid is None:
+            # 选中了「分组」（父类别）—— 它不参与计时，它的时长是子类别的合计
+            QMessageBox.information(
+                None, "先选一个子类别",
+                "父类别只是分组，不能直接计时。\n展开它，选下面具体的子类别。",
+            )
             return
 
         with SessionLocal() as db:
@@ -545,11 +599,44 @@ def signal_existing_instance(timeout_ms: int = 400, attempts: int = 6) -> bool:
     return False
 
 
+def _install_exception_guard() -> None:
+    """
+    装一个全局异常兜底。
+
+    ★ 为什么必须装：PyQt5 对**槽函数里没接住的异常**默认直接 abort() 整个进程。
+      表现是程序「毫无征兆地消失」—— 连 finally 和 stdout 缓冲都会丢掉，
+      用户看不到任何提示，也来不及善后。实测退出码是 0xC0000409。
+
+      把 sys.excepthook 换掉之后，PyQt 会改走我们的函数，进程不再被杀。
+      （这个是实测出来的：写验证脚本时槽里有个 KeyError，结果数据清理没跑、
+      输出也全丢了，才顺着查到这条。）
+
+    这里做两件事：控制台打完整 traceback（方便排查）
+    ＋ 弹窗告诉用户（别让程序凭空消失）。
+    """
+    def hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        try:
+            QMessageBox.critical(
+                None, "出了点问题",
+                f"程序遇到一个没预料到的错误，不过还在继续运行。\n\n"
+                f"{exc_type.__name__}: {exc}\n\n"
+                f"完整信息在控制台里。如果界面变得不正常，重启一下程序。",
+            )
+        except Exception:                        # noqa: BLE001 —— 兜底里不能再抛
+            pass
+
+    sys.excepthook = hook
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("FocusTimer")
     app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)      # 关看板不等于退出
+
+    # ★ 必须尽早装：装在 QApplication 之后、任何界面接信号之前
+    _install_exception_guard()
 
     # ★ 单实例必须在 init_db() 之前 —— 第二个实例不该白连一次数据库
     if signal_existing_instance():

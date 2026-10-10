@@ -82,10 +82,10 @@ def _ai_settings() -> tuple[str, str, str]:
     """
     (base_url, api_key, model)。
 
-    现在从环境变量 / 中央 .env 读；v0.3.0 会改成读安装目录下的 ai_config.json。
-    单独抽成函数是为了到时候只改这一处。
+    取值优先级（ai_config.json > 环境变量/.env > 内置默认）在 config.ai_settings()
+    里统一处理 —— 这里只是转一道，保证「界面里填的」立刻生效。
     """
-    return config.DEEPSEEK_BASE_URL, config.DEEPSEEK_API_KEY, config.DEEPSEEK_MODEL
+    return config.ai_settings()
 
 
 def _max_tokens(n_chars: int) -> int:
@@ -180,6 +180,74 @@ def _parse(text: str) -> tuple[str, list[str]]:
     keywords = [str(x).strip() for x in raw_kw if str(x).strip()]
 
     return (paragraph, keywords)
+
+
+def test_connection(
+    base_url: str, api_key: str, model: str, timeout: float = 20.0
+) -> tuple[bool, str]:
+    """
+    拿界面上刚填的参数打一次最小请求 —— 设置窗口的「测试连接」。
+
+    不猜、不缓存：直接问接口「这个 key + 这个模型能不能用」，
+    比让用户整理失败之后再来排查强得多。
+
+    Returns:
+        (是否成功, 给人看的一句话)
+    """
+    base_url = (base_url or "").strip()
+    model = (model or "").strip()
+    if not api_key:
+        return (False, "还没填 API Key")
+    if not base_url:
+        return (False, "还没填接口地址")
+    if not model:
+        return (False, "还没填模型名")
+
+    try:
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 8,
+                "thinking": {"type": "disabled"},
+            },
+            timeout=timeout,
+        )
+    except httpx.TimeoutException:
+        return (False, f"超时（{timeout:.0f} 秒）—— 检查网络或接口地址")
+    except Exception as e:                       # noqa: BLE001
+        return (False, f"连不上：{e}")
+
+    if resp.status_code == 200:
+        return (True, f"连接正常，模型「{model}」可用")
+
+    # 把接口的报错原文带出来 —— 401/404/400 的原因都在里面
+    detail = ""
+    try:
+        body = resp.json()
+        detail = (body.get("error") or {}).get("message") or body.get("message") or ""
+    except Exception:                            # noqa: BLE001
+        detail = (resp.text or "")[:200]
+
+    hint = {
+        401: "API Key 不对或被停用",
+        402: "账户余额不足",
+        403: "这个 Key 没有访问该模型的权限",
+        404: "接口地址不对（注意结尾要不要 /v1）",
+        429: "请求太频繁，稍后再试",
+    }.get(resp.status_code, "")
+
+    msg = f"HTTP {resp.status_code}"
+    if hint:
+        msg += f" · {hint}"
+    if detail:
+        msg += f" —— {detail[:200]}"
+    return (False, msg)
 
 
 def polish(raw_text: str, category_name: str = "") -> tuple[str, list[str]]:

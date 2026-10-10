@@ -119,21 +119,126 @@ def today_total(db: Session) -> int:
     return int(total or 0)
 
 
-# ────────────────────────── 类别 ──────────────────────────
+# ────────────────────────── 类别（二级目录）──────────────────────────
+#
+# 层级规则（刻意只允许两级 —— 够用，而且不容易搞乱）：
+#   · 顶层类别可以带子类别。带了子类别就是「分组」，**不能直接拿来计时**
+#   · 没有子类别的类别 = 叶子，可以计时
+#   · 子类别不能再带子类别；带子类别的类别也不能被移进别人下面（否则就三级了）
+#   · 父类别的显示时长 = 自己 + 所有子类别
+#
+# 树是用 parent_id 显式查出来拼的，不走 ORM 自引用关系 —— 原因见 db/models.py。
 
-def list_categories(db: Session) -> list[Category]:
-    """置顶的排前面，其余按 sort_order。"""
+def _duration_by_category(db: Session) -> dict[int, int]:
+    """每个类别**自己**的（不含子类别）已完成学习秒数。一次查询拿完。"""
+    rows = db.execute(
+        select(
+            FocusSession.category_id,
+            func.coalesce(func.sum(FocusSession.duration_seconds), 0),
+        )
+        .where(FocusSession.status == SessionStatus.completed)
+        .group_by(FocusSession.category_id)
+    ).all()
+    return {int(cid): int(total) for cid, total in rows}
+
+
+def category_tree(db: Session) -> list[dict]:
+    """
+    两级类别树 + 汇总时长。
+
+    返回 [{cat, own, total, children: [{cat, own, total}, ...]}, ...]
+      own   = 这个类别自己的学习秒数
+      total = 自己 + 所有子类别（父类别在界面上显示这个）
+
+    排序：顶层 is_pinned DESC, sort_order, id —— 置顶优先，且顺序稳定不跳。
+    两级都现算，不存冗余字段。
+    """
+    cats = list(db.scalars(select(Category)))
+    own = _duration_by_category(db)
+    by_id = {c.id: c for c in cats}
+
+    kids: dict[int, list[Category]] = {}
+    roots: list[Category] = []
+    for c in cats:
+        pid = c.parent_id
+        # 父不在了（外键的 ON DELETE SET NULL 本该兜住）就当顶层 ——
+        # 无论如何不能让一个类别从界面上凭空消失
+        if pid and pid in by_id and pid != c.id:
+            kids.setdefault(pid, []).append(c)
+        else:
+            roots.append(c)
+
+    roots.sort(key=lambda c: (not c.is_pinned, c.sort_order, c.id))
+
+    tree = []
+    for r in roots:
+        children = sorted(kids.get(r.id, []), key=lambda c: (c.sort_order, c.id))
+        own_r = own.get(r.id, 0)
+        tree.append(
+            {
+                "cat": r,
+                "own": own_r,
+                "total": own_r + sum(own.get(k.id, 0) for k in children),
+                # 子节点也带上 children: [] —— 形状统一，调用方不用先判断
+                # 「这是父还是子」再决定能不能取 node["children"]
+                "children": [
+                    {
+                        "cat": k,
+                        "own": own.get(k.id, 0),
+                        "total": own.get(k.id, 0),
+                        "children": [],
+                    }
+                    for k in children
+                ],
+            }
+        )
+    return tree
+
+
+def category_totals(db: Session) -> list[tuple[Category, int]]:
+    """
+    平铺的 [(Category, 总秒数)]，父类别的总秒数是「自己 + 子类别」的合计。
+
+    保留平铺形状是为了不动现有的调用点（悬浮窗、状态恢复、选择器）。
+    父总是排在它的子类别前面；要看层级结构用 category_tree()。
+    """
+    out: list[tuple[Category, int]] = []
+    for node in category_tree(db):
+        out.append((node["cat"], node["total"]))
+        for ch in node["children"]:
+            out.append((ch["cat"], ch["total"]))
+    return out
+
+
+def leaf_categories(db: Session) -> list[tuple[Category, int]]:
+    """
+    能拿来计时的类别 —— 只有叶子。
+
+    父类别只是分组、不参与计时：它的时长本来就是子类别的合计，
+    要是它自己也能计时，那段时间该算给谁就说不清了。
+    """
+    out: list[tuple[Category, int]] = []
+    for node in category_tree(db):
+        if node["children"]:
+            out.extend((ch["cat"], ch["total"]) for ch in node["children"])
+        else:
+            out.append((node["cat"], node["total"]))
+    return out
+
+
+def category_children(db: Session, category_id: int) -> list[Category]:
+    """某个类别的直接子类别，按 sort_order。"""
     return list(
         db.scalars(
-            select(Category).order_by(
-                Category.is_pinned.desc(), Category.sort_order, Category.id
-            )
+            select(Category)
+            .where(Category.parent_id == category_id)
+            .order_by(Category.sort_order, Category.id)
         )
     )
 
 
 def toggle_pin(db: Session, category_id: int) -> Category:
-    """置顶 / 取消置顶。"""
+    """置顶 / 取消置顶（只对顶层有意义）。"""
     cat = db.get(Category, category_id)
     if cat is None:
         raise ValueError("类别不存在")
@@ -143,16 +248,30 @@ def toggle_pin(db: Session, category_id: int) -> Category:
     return cat
 
 
-def add_category(db: Session, name: str) -> Category:
-    """新建类别，排在最后。"""
+def add_category(db: Session, name: str, parent_id: int | None = None) -> Category:
+    """
+    新建类别，排在最后。
+
+    parent_id 给了就建成它的子类别 —— 只允许两级，所以父必须是顶层类别。
+    """
     name = (name or "").strip()
     if not name:
         raise ValueError("类别名不能为空")
     if db.scalars(select(Category).where(Category.name == name)).first():
         raise ValueError(f"已经有「{name}」这个类别了")
 
-    max_order = db.scalar(select(func.max(Category.sort_order))) or 0
-    cat = Category(name=name, sort_order=max_order + 1)
+    if parent_id is not None:
+        parent = db.get(Category, parent_id)
+        if parent is None:
+            raise ValueError("父类别不存在")
+        if parent.parent_id is not None:
+            raise ValueError(f"「{parent.name}」已经是子类别了 —— 只支持两级目录")
+
+    # 排序号在同一层内递增
+    max_order = db.scalar(
+        select(func.max(Category.sort_order)).where(Category.parent_id == parent_id)
+    ) or 0
+    cat = Category(name=name, sort_order=max_order + 1, parent_id=parent_id)
     db.add(cat)
     db.commit()
     db.refresh(cat)
@@ -181,8 +300,45 @@ def rename_category(db: Session, category_id: int, new_name: str) -> Category:
     return cat
 
 
+def move_category(db: Session, category_id: int, parent_id: int | None) -> Category:
+    """
+    把类别移到某个父类别下；parent_id=None 表示移回顶层。
+
+    三条限制，都是为了防止层级被搞乱：
+      · 不能移到自己下面
+      · 目标必须是**顶层**类别（只允许两级）
+      · 自己不能带着子类别 —— 否则移进去就成三级了
+    """
+    cat = db.get(Category, category_id)
+    if cat is None:
+        raise ValueError("类别不存在")
+
+    if parent_id is None:
+        cat.parent_id = None
+        db.commit()
+        db.refresh(cat)
+        return cat
+
+    if parent_id == category_id:
+        raise ValueError("不能把类别移到自己下面")
+
+    parent = db.get(Category, parent_id)
+    if parent is None:
+        raise ValueError("目标父类别不存在")
+    if parent.parent_id is not None:
+        raise ValueError(f"「{parent.name}」已经是子类别了 —— 只支持两级目录")
+
+    if category_children(db, category_id):
+        raise ValueError(f"「{cat.name}」下面还有子类别，不能再被移进别的类别")
+
+    cat.parent_id = parent_id
+    db.commit()
+    db.refresh(cat)
+    return cat
+
+
 def category_stats(db: Session, category_id: int) -> tuple[int, int]:
-    """(记录数, 总秒数) —— 删类别前拿这个去警告用户。"""
+    """(记录数, 总秒数) —— 删类别前拿这个去警告用户。只算它自己的记录。"""
     row = db.execute(
         select(
             func.count(FocusSession.id),
@@ -195,11 +351,16 @@ def category_stats(db: Session, category_id: int) -> tuple[int, int]:
     return int(row[0]), int(row[1])
 
 
-def delete_category(db: Session, category_id: int, force: bool = False) -> None:
+def delete_category(db: Session, category_id: int, force: bool = False) -> list[str]:
     """
-    删除类别。**连同它的学习记录和条目一起删。**
+    删除类别。**连同它自己的学习记录和关键词一起删。**
+
+    ★ 如果它下面还有子类别：**先把子类别提到顶层**（它们的记录一条都不动），
+      再删它自己。绝不连带删子类别 —— 那会一下子抹掉几十个小时的学习记录。
 
     有记录时默认拒绝（force=False），逼调用方先去问用户。
+
+    Returns: 被提到顶层的子类别名（界面拿去提示用户）
     """
     cat = db.get(Category, category_id)
     if cat is None:
@@ -209,34 +370,18 @@ def delete_category(db: Session, category_id: int, force: bool = False) -> None:
     if n_sessions and not force:
         raise ValueError(f"该类有 {n_sessions} 条学习记录，删除会一并清掉")
 
+    children = category_children(db, category_id)
+    for k in children:
+        k.parent_id = None
+    if children:
+        db.flush()
+
     # 手动级联（模型里没配 ON DELETE CASCADE）
     db.query(Item).filter(Item.category_id == category_id).delete()
     db.query(FocusSession).filter(FocusSession.category_id == category_id).delete()
     db.delete(cat)
     db.commit()
-
-
-def category_totals(db: Session) -> list[tuple[Category, int]]:
-    """
-    每个类别的总专注秒数 —— 现算，不存冗余字段。
-
-    返回 [(Category, 总秒数), ...]，按总时长倒序。
-    """
-    rows = db.execute(
-        select(
-            Category,
-            func.coalesce(func.sum(FocusSession.duration_seconds), 0).label("total"),
-        )
-        .outerjoin(
-            FocusSession,
-            (FocusSession.category_id == Category.id)
-            & (FocusSession.status == SessionStatus.completed),
-        )
-        .group_by(Category.id)
-        # 置顶优先，其次按 sort_order（不再按时长排 —— 顺序要稳定，否则每次刷新都跳）
-        .order_by(Category.is_pinned.desc(), Category.sort_order, Category.id)
-    ).all()
-    return [(cat, int(total)) for cat, total in rows]
+    return [k.name for k in children]
 
 
 # ────────────────────────── 专注记录 ──────────────────────────
@@ -491,7 +636,9 @@ def set_polish(
     return created
 
 
-def category_records(db: Session, category_id: int, limit: int = 200) -> list[dict]:
+def category_records(
+    db: Session, category_id: int, limit: int = 200, include_children: bool = False
+) -> list[dict]:
     """
     某类别下写完总结的记录 —— 看板右侧渲染段落卡片用。
 
@@ -501,13 +648,21 @@ def category_records(db: Session, category_id: int, limit: int = 200) -> list[di
 
     没整理过的记录 polished_text 是 None，界面上回退显示 raw_text 原文。
 
+    include_children: 选中的是**父类别**（分组）时传 True ——
+        这时把子类别的记录也一起捞出来，卡片上会标出各自属于哪个子类别。
+        父类别本来就是「自己 + 子类别」的合计，点进去却什么都看不到会很怪。
+
     limit: 只取最近这么多条 —— 卡片是真实 widget，几千条会把界面拖死。
     """
+    cat_ids = [category_id]
+    if include_children:
+        cat_ids += [c.id for c in category_children(db, category_id)]
+
     sessions = list(
         db.scalars(
             select(FocusSession)
             .where(
-                FocusSession.category_id == category_id,
+                FocusSession.category_id.in_(cat_ids),
                 FocusSession.status == SessionStatus.completed,
             )
             .order_by(FocusSession.start_time.desc(), FocusSession.id.desc())
@@ -523,9 +678,17 @@ def category_records(db: Session, category_id: int, limit: int = 200) -> list[di
     ):
         by_session[item.session_id].append(item.name)
 
+    # 父类别视角下要标出每条记录属于哪个子类别，先把名字查好（一次查询）
+    names = {
+        c.id: c.name
+        for c in db.scalars(select(Category).where(Category.id.in_(cat_ids)))
+    }
+
     return [
         {
             "id": s.id,
+            "category_id": s.category_id,
+            "category_name": names.get(s.category_id, ""),
             "start_time": s.start_time,
             "end_time": s.end_time,
             "duration_seconds": s.duration_seconds or 0,

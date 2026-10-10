@@ -18,6 +18,16 @@ python db/database.py                # 首次：建库建表 + 预置类别
 python main.py                       # 启动
 ```
 
+数据库连接串放在项目根目录的 `.env` 里（照 `.env.example` 复制一份）。
+
+**AI 不需要配 `.env`** —— 启动后在悬浮窗右键「⚙ 设置 → AI 整理」里填 API Key 就行，
+配置会写进安装目录下的 `ai_config.json`。选「DeepSeek 官方 · V4.1 Flash」预设的话，
+只需要粘一个 Key，接口地址和模型名都自动填好；也可以选「自定义」接任何 OpenAI 兼容接口。
+旁边有「测试连接」，当场告诉你 Key 和模型能不能用。
+
+> `ai_config.json` 里是**明文 Key**，别把它发给别人 —— 它已经被 `.gitignore` 挡住了。
+> 打包分发时这个文件是空的，谁用谁填，所以 exe 不再需要跟着一个 `.env` 走。
+
 ## 用法
 
 | 操作 | 效果 |
@@ -39,6 +49,21 @@ python main.py                       # 启动
 **暂停计时看得见** —— 暂停时悬浮窗大数字变成「本次已暂停多久」往上走，
 下方小字显示这一段专注累计暂停了多久。
 
+**类别支持二级目录** —— 顶层类别下面可以挂子类别，方便分类管理：
+
+```
+Agent 系列          ·  51.9 h   ·  2 子项     ← 分组，显示的是合计
+  ├ Agent 主循环    ·  32.4 h
+  └ MCP 协议        ·  19.5 h
+机器学习            ·   3.1 h                ← 没有子类别，它自己就是叶子
+```
+
+- 父类别的时长 = **自己 + 所有子类别**，点进去能看到子类别的全部记录（卡片上标了来自哪一个）
+- 父类别是「分组」，**不能直接拿来计时** —— 否则那段时间算给谁就说不清了
+- 只允许两级；带子类别的类别不能再被移进别的类别（那样就三级了）
+- 删除父类别时，子类别会被**移到顶层**，它们的学习记录一条都不会丢
+- 看板左栏右键：置顶 / ➕ 新建子类别 / 📁 移动到… / 重命名 / 删除
+
 专注↔休息切换时会**响一声**（可在设置里关；换 `assets/*.wav` 可换音色）。
 
 **只有一个实例** —— 重复双击 exe 不会开第二个窗口，而是把已在跑的那个叫到前台。
@@ -50,17 +75,19 @@ python main.py                       # 启动
 
 - **GUI**：PyQt5（无边框 + 置顶 + 圆角半透明）
 - **数据**：SQLAlchemy + MySQL 8
-- **AI**：DeepSeek（把总结整理成一段通顺的话 + 提炼关键词）
+- **AI**：DeepSeek（把总结整理成一段通顺的话 + 提炼关键词），接口可在设置里换成任何 OpenAI 兼容服务
 
 ## 目录
 
 ```
-main.py          入口 + 单实例锁
-config.py        配置（自动读家目录 study/.env 的 DeepSeek key）
-db/              models.py（4 张表）· database.py
-services/        timer.py（计时业务）· settings.py · sound.py（提示音）· llm.py（整理成段落）
-ui/              floating.py（悬浮窗）· review_dialog.py · settings_dialog.py · dashboard.py（段落卡片）
+main.py          入口 + 单实例锁 + 全局异常兜底
+config.py        配置（数据库连接串 + AI 配置的读写与优先级）
+db/              models.py（4 张表）· database.py（建表 + 幂等迁移）
+services/        timer.py（计时业务 + 类别树）· settings.py · sound.py · llm.py（整理成段落）
+ui/              floating.py（悬浮窗）· review_dialog.py · dashboard.py（类别树 + 段落卡片）
+                 settings_dialog.py（专注节奏 + AI 配置）
 assets/          focus_end.wav · break_end.wav（可替换）
+ai_config.json   界面上填的 AI 配置（自动生成，已被 gitignore）
 ```
 
 ## 自检
@@ -95,6 +122,19 @@ python ui/floating.py      # 单独预览悬浮窗
 **单实例靠命名管道** —— `QLocalServer` 占住一个名字；第二个进程探测到就直接退出，
 顺便把老实例的窗口叫到前台。没有这个的话，双击两次 exe 会得到两个悬浮窗，
 两边各连各的数据库，数据会打架。
+
+**休息时长是反推出来的，不是另存一列**
+
+```
+休息 = (结束时间 − 开始时间) − 暂停秒数 − 专注时长
+```
+
+`duration_seconds` 是当时按当时的设置定死的，所以这么反推出来的休息时间**永远一致** ——
+以后把「专注 25 分 / 休息 5 分」改成别的，历史记录的休息时长也不会跟着变（那才是篡改历史）。
+
+**全局异常兜底** —— PyQt5 对槽函数里没接住的异常默认会 `abort()` 整个进程：
+程序毫无征兆地消失，连 `finally` 都不执行。所以 `main.py` 换掉了 `sys.excepthook`，
+改成控制台打完整 traceback + 弹窗告知，进程不再被杀。
 
 ---
 

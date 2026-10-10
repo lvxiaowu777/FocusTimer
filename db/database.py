@@ -43,6 +43,8 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     "category": [
         ("is_pinned",
          "ALTER TABLE category ADD COLUMN is_pinned TINYINT(1) NOT NULL DEFAULT 0"),
+        ("parent_id",
+         "ALTER TABLE category ADD COLUMN parent_id INT NULL"),
     ],
     "session": [
         ("skipped_seconds",
@@ -60,6 +62,10 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
 
 # 表名 → [(索引名, 建索引 SQL), ...]
 _INDEXES: dict[str, list[tuple[str, str]]] = {
+    "category": [
+        ("idx_category_parent",
+         "CREATE INDEX idx_category_parent ON category (parent_id)"),
+    ],
     "item": [
         ("idx_item_session",
          "CREATE INDEX idx_item_session ON item (session_id)"),
@@ -68,6 +74,13 @@ _INDEXES: dict[str, list[tuple[str, str]]] = {
 
 # 表名 → [(外键名, 建外键 SQL), ...]
 _FKS: dict[str, list[tuple[str, str]]] = {
+    "category": [
+        # ON DELETE SET NULL：万一父类别被直接删掉（绕过应用层），
+        # 子类别会变成顶层，而不是被连带删除 —— 保住学习记录。
+        ("fk_category_parent",
+         "ALTER TABLE category ADD CONSTRAINT fk_category_parent "
+         "FOREIGN KEY (parent_id) REFERENCES category(id) ON DELETE SET NULL"),
+    ],
     "item": [
         ("fk_item_session",
          "ALTER TABLE item ADD CONSTRAINT fk_item_session "

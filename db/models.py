@@ -52,13 +52,25 @@ class Category(Base):
     is_pinned: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, server_default="0"
     )
+    # 二级目录：NULL = 顶层。
+    # 父类别只用来分组、不能直接拿来计时，它的时长是「自己 + 所有子类别」的合计
+    # （见 services/timer.category_tree）。
+    # 刻意**不建** ORM 的 parent/children 自引用关系：自引用关系在脱管对象上很容易
+    # 踩懒加载的坑，而树只有两级，显式查询反而更清楚。
+    parent_id: Mapped[int | None] = mapped_column(
+        ForeignKey("category.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
     sessions: Mapped[list["FocusSession"]] = relationship(back_populates="category")
     items: Mapped[list["Item"]] = relationship(back_populates="category")
 
+    __table_args__ = (
+        Index("idx_category_parent", "parent_id"),
+    )
+
     def __repr__(self) -> str:
-        return f"<Category id={self.id} name={self.name!r}>"
+        return f"<Category id={self.id} name={self.name!r} parent={self.parent_id}>"
 
 
 class FocusSession(Base):

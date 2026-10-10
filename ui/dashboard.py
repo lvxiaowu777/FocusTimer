@@ -26,14 +26,14 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QTextBrowser,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -41,6 +41,10 @@ from PyQt5.QtWidgets import (
 from db.database import SessionLocal
 from services import llm as llm_svc
 from services import timer as timer_svc
+
+# 树控件里存自定义数据的角色
+ROLE_ID = Qt.UserRole              # 类别 id
+ROLE_IS_GROUP = Qt.UserRole + 1    # 是不是「分组」（有子类别，不能计时）
 
 QSS = """
 QWidget#root { background: #ffffff; }
@@ -51,13 +55,15 @@ QLabel#today {
     color: #1d4ed8; font-size: 12px; font-weight: bold;
     background: #eff6ff; border-radius: 11px; padding: 5px 13px;
 }
-QListWidget {
+QTreeWidget {
     border: 1px solid #e5e7eb; border-radius: 8px;
     font-size: 12px; color: #374151; outline: none; padding: 4px;
+    background: #ffffff;
 }
-QListWidget::item { padding: 7px 8px; border-radius: 6px; }
-QListWidget::item:selected { background: #eff6ff; color: #1d4ed8; }
-QListWidget::item:hover { background: #f9fafb; }
+QTreeWidget::item { padding: 7px 4px; border-radius: 6px; min-height: 18px; }
+QTreeWidget::item:selected { background: #eff6ff; color: #1d4ed8; }
+QTreeWidget::item:hover { background: #f9fafb; }
+QTreeWidget::branch { background: transparent; }
 QPushButton {
     border: 1px solid #e5e7eb; border-radius: 6px;
     padding: 5px 12px; font-size: 11px; color: #374151; background: #ffffff;
@@ -75,6 +81,10 @@ QScrollArea#scroll { border: none; background: #ffffff; }
 QWidget#cardsHost { background: #ffffff; }
 QFrame#card { background: #fafafa; border: 1px solid #e5e7eb; border-radius: 8px; }
 QLabel#cardWhen { color: #3b82f6; font-size: 11px; font-weight: bold; }
+QLabel#cardCat  {
+    color: #6d28d9; background: #f3e8ff;
+    border-radius: 8px; padding: 1px 7px; font-size: 10px; font-weight: bold;
+}
 QLabel#cardStat { color: #6b7280; font-size: 11px; }
 QLabel#cardTag  {
     color: #b45309; background: #fef3c7;
@@ -196,7 +206,7 @@ class RecordCard(QFrame):
     # 超过这个长度就不在卡片里展开了 —— 展开会得到上万像素高的卡片，没法看
     INLINE_EXPAND_MAX = 2500
 
-    def __init__(self, rec: dict, on_repolish=None) -> None:
+    def __init__(self, rec: dict, on_repolish=None, show_category: bool = False) -> None:
         super().__init__()
         self.setObjectName("card")
         self._rec = rec
@@ -210,6 +220,12 @@ class RecordCard(QFrame):
         # —— 时间行：开始 → 结束 · 专注 · 休息 ——
         head = QHBoxLayout()
         head.setSpacing(8)
+
+        # 看「分组」时记录来自不同子类别，得标出来是哪一条
+        if show_category and rec.get("category_name"):
+            cat_tag = QLabel(rec["category_name"])
+            cat_tag.setObjectName("cardCat")
+            head.addWidget(cat_tag)
 
         when = QLabel(f"{fmt_clock(rec['start_time'])} → {fmt_clock(rec['end_time'])}")
         when.setObjectName("cardWhen")
@@ -323,15 +339,21 @@ class Dashboard(QWidget):
         left = QVBoxLayout()
         left.setSpacing(6)
 
-        lab1 = QLabel("类别 · 累计专注（右键可置顶）")
+        lab1 = QLabel("类别 · 累计专注（右键：置顶 / 建子类别 / 移动）")
         lab1.setObjectName("h2")
         left.addWidget(lab1)
 
-        self.cat_list = QListWidget()
-        self.cat_list.currentItemChanged.connect(self._on_selection_changed)
+        # 二级目录 → 用树。父类别是「分组」，它的时长是自己 + 子类别的合计。
+        self.cat_list = QTreeWidget()
+        self.cat_list.setHeaderHidden(True)
+        self.cat_list.setColumnCount(1)
+        self.cat_list.setIndentation(14)
+        self.cat_list.setExpandsOnDoubleClick(False)
         self.cat_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.cat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.cat_list.customContextMenuRequested.connect(self._on_context_menu)
+        self.cat_list.currentItemChanged.connect(self._on_selection_changed)
+        self.cat_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         left.addWidget(self.cat_list)
 
         self.total_label = QLabel("—")
@@ -342,8 +364,14 @@ class Dashboard(QWidget):
         row.setSpacing(6)
         btn_add = QPushButton("+ 新建类别")
         btn_add.setObjectName("primary")
+        btn_add.setToolTip("新建一个顶层类别")
         btn_add.clicked.connect(self._on_add)
         row.addWidget(btn_add)
+
+        self.btn_add_child = QPushButton("+ 子类别")
+        self.btn_add_child.setToolTip("在当前选中的类别下面建一个子类别")
+        self.btn_add_child.clicked.connect(self._on_add_child)
+        row.addWidget(self.btn_add_child)
 
         btn_del = QPushButton("删除")
         btn_del.clicked.connect(self._on_delete)
@@ -399,7 +427,8 @@ class Dashboard(QWidget):
         self._job_timer.setInterval(400)
         self._job_timer.timeout.connect(self._poll_job)
 
-        self._categories: list = []
+        # 缓存的类别树（category_tree 的结果），避免每次点击都重建
+        self._tree: list = []
         self.refresh()
 
     # ────────────────────────── 关窗 = 收起，不是销毁 ──────────────────────────
@@ -418,15 +447,39 @@ class Dashboard(QWidget):
 
     def _current_id(self) -> int | None:
         item = self.cat_list.currentItem()
-        return item.data(Qt.UserRole) if item else None
+        return item.data(0, ROLE_ID) if item else None
+
+    def _current_is_group(self) -> bool:
+        """当前选中的是不是「分组」（有子类别）。"""
+        item = self.cat_list.currentItem()
+        return bool(item.data(0, ROLE_IS_GROUP)) if item else False
+
+    def _find_node(self, cid: int) -> dict | None:
+        """在缓存的树里按 id 找节点（顶层或子层都能找到）。"""
+        for node in self._tree:
+            if node["cat"].id == cid:
+                return node
+            for ch in node["children"]:
+                if ch["cat"].id == cid:
+                    return ch
+        return None
 
     def refresh(self, select_id: int | None = None) -> None:
-        """重新拉数据。select_id 指定要选中的类别。"""
+        """重新拉数据并重建左边的树。select_id 指定要选中的类别。"""
         if select_id is None:
             select_id = self._current_id()
 
+        # 记住哪些分组是展开的，重建之后恢复 —— 否则每次刷新都折叠回去
+        expanded = set()
+        it = QTreeWidgetItem()
+        root = self.cat_list.invisibleRootItem()
+        for i in range(root.childCount()):
+            child = root.child(i)
+            if child.isExpanded():
+                expanded.add(child.data(0, ROLE_ID))
+
         with SessionLocal() as db:
-            self._categories = timer_svc.category_totals(db)
+            self._tree = timer_svc.category_tree(db)
             today = timer_svc.today_total(db)
             pending = len(timer_svc.unpolished_records(db))
         self.today_label.setText(f"今日累计 {fmt_hours(today)}")
@@ -436,44 +489,98 @@ class Dashboard(QWidget):
             f"✨ 批量整理 ({pending})" if pending else "✨ 批量整理"
         )
 
-        if select_id is None and self._categories:
-            select_id = self._categories[0][0].id
+        if select_id is None and self._tree:
+            select_id = self._tree[0]["cat"].id
 
         self.cat_list.blockSignals(True)
         self.cat_list.clear()
-        target_row = None
-        for i, (cat, total) in enumerate(self._categories):
-            mark = "📌 " if cat.is_pinned else "     "
-            item = QListWidgetItem(f"{mark}{cat.name}    ·    {fmt_hours(total)}")
-            item.setData(Qt.UserRole, cat.id)
+        target: QTreeWidgetItem | None = None
+        first: QTreeWidgetItem | None = None
+
+        for node in self._tree:
+            cat, total = node["cat"], node["total"]
+            is_group = bool(node["children"])
+            mark = "📌 " if cat.is_pinned else ""
+            label = f"{mark}{cat.name}    ·    {fmt_hours(total)}"
+            if is_group:
+                # 用最短的说法，否则左栏窄的时候会被省略号吃掉后半截
+                label += f"    ·    {len(node['children'])} 子项"
+
+            item = QTreeWidgetItem([label])
+            item.setData(0, ROLE_ID, cat.id)
+            item.setData(0, ROLE_IS_GROUP, is_group)
             item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
-            self.cat_list.addItem(item)
+            if is_group:
+                item.setToolTip(0, "这是分组，不能直接计时 —— 请选它下面的子类别")
+            self.cat_list.addTopLevelItem(item)
+
+            for ch in node["children"]:
+                sub = QTreeWidgetItem(
+                    [f"{ch['cat'].name}    ·    {fmt_hours(ch['total'])}"]
+                )
+                sub.setData(0, ROLE_ID, ch["cat"].id)
+                sub.setData(0, ROLE_IS_GROUP, False)
+                sub.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                item.addChild(sub)
+
+            # 有子类别的默认展开；用户手动折起来的保持折起
+            item.setExpanded(True if not expanded and is_group else cat.id in expanded)
+
+            if first is None:
+                first = item
             if cat.id == select_id:
-                target_row = i
+                target = item
+            elif not target:
+                for j in range(item.childCount()):
+                    if item.child(j).data(0, ROLE_ID) == select_id:
+                        target = item.child(j)
+
         self.cat_list.blockSignals(False)
 
-        if self.cat_list.count():
-            self.cat_list.setCurrentRow(target_row if target_row is not None else 0)
+        # 选中目标；目标在折起来的父节点里就把它展开
+        pick = target or first
+        if pick is not None:
+            parent = pick.parent()
+            if parent is not None:
+                parent.setExpanded(True)
+            self.cat_list.setCurrentItem(pick)
             self._on_selection_changed()
 
     def _on_selection_changed(self, *_) -> None:
         cid = self._current_id()
         if cid is None:
             self.total_label.setText("—")
+            self.items_title.setText("学过什么")
             self._clear_cards()
             return
 
-        entry = next((c for c in self._categories if c[0].id == cid), None)
-        if entry is None:
+        node = self._find_node(cid)
+        if node is None:
             return
-        cat, total = entry
-        self.total_label.setText(f"共 {fmt_hours(total)}")
+        cat = node["cat"]
+        is_group = bool(node["children"])
+
+        # 分组显示合计；子类别/叶子显示自己的
+        self.total_label.setText(f"共 {fmt_hours(node['total'])}")
 
         with SessionLocal() as db:
-            records = timer_svc.category_records(db, cat.id)
+            records = timer_svc.category_records(
+                db, cat.id, include_children=is_group
+            )
 
-        self.items_title.setText(f"「{cat.name}」· {len(records)} 次专注")
-        self._rebuild_cards(records)
+        if is_group:
+            self.items_title.setText(
+                f"「{cat.name}」分组 · {len(node['children'])} 个子类别 · "
+                f"{len(records)} 次专注（含子类别）"
+            )
+        else:
+            self.items_title.setText(f"「{cat.name}」· {len(records)} 次专注")
+        self._rebuild_cards(records, show_category=is_group)
+
+    def _on_item_double_clicked(self, item, _column) -> None:
+        """双击分组 = 展开/折叠（改了 setExpandsOnDoubleClick，得自己来）。"""
+        if item.childCount():
+            item.setExpanded(not item.isExpanded())
 
     # ────────────────────────── 段落卡片 ──────────────────────────
 
@@ -494,7 +601,7 @@ class Dashboard(QWidget):
                 w.setParent(None)
                 w.deleteLater()
 
-    def _rebuild_cards(self, records: list[dict]) -> None:
+    def _rebuild_cards(self, records: list[dict], show_category: bool = False) -> None:
         self._clear_cards()
 
         if not records:
@@ -506,7 +613,9 @@ class Dashboard(QWidget):
             return
 
         for rec in records:
-            self.cards_layout.addWidget(RecordCard(rec, on_repolish=self._repolish_one))
+            self.cards_layout.addWidget(
+                RecordCard(rec, on_repolish=self._repolish_one, show_category=show_category)
+            )
         self.cards_layout.addStretch()
         self.scroll.verticalScrollBar().setValue(0)
 
@@ -601,17 +710,23 @@ class Dashboard(QWidget):
     # ────────────────────────── 置顶 ──────────────────────────
 
     def _on_toggle_pin(self) -> None:
-        """置顶 / 取消置顶当前选中的类别。"""
+        """置顶 / 取消置顶当前选中的类别（只对顶层有意义）。"""
         cid = self._current_id()
         if cid is None:
+            return
+        if self.cat_list.currentItem() is not None and self.cat_list.currentItem().parent():
+            QMessageBox.information(
+                self, "子类别不能置顶", "置顶只作用于顶层类别 —— 子类别跟着父类别走。"
+            )
             return
         with SessionLocal() as db:
             timer_svc.toggle_pin(db, cid)
         self.refresh(select_id=cid)
 
-    # ────────────────────────── 增 / 删 / 改 ──────────────────────────
+    # ────────────────────────── 增 / 删 / 改 / 移动 ──────────────────────────
 
     def _on_add(self) -> None:
+        """新建顶层类别。"""
         name, ok = QInputDialog.getText(self, "新建类别", "类别名（如：RAG / Agent）")
         if not ok or not name.strip():
             return
@@ -624,31 +739,125 @@ class Dashboard(QWidget):
             return
         self.refresh(select_id=new_id)
 
+    def _on_add_child(self) -> None:
+        """在当前选中的类别下面建子类别。"""
+        cid = self._current_id()
+        if cid is None:
+            QMessageBox.information(self, "先选一个类别", "先在上面选中要挂到哪个类别下面。")
+            return
+        node = self._find_node(cid)
+        if node is None:
+            return
+        parent = node["cat"]
+
+        name, ok = QInputDialog.getText(
+            self, "新建子类别", f"挂在「{parent.name}」下面，子类别名："
+        )
+        if not ok or not name.strip():
+            return
+        try:
+            with SessionLocal() as db:
+                cat = timer_svc.add_category(db, name, parent.id)
+                new_id = cat.id
+        except ValueError as e:
+            QMessageBox.warning(self, "没能新建", str(e))
+            return
+        self.refresh(select_id=new_id)
+
+    def _on_move(self) -> None:
+        """
+        把当前类别移到别的顶层类别下面，或移回顶层。
+
+        只允许两级，所以候选父只能是顶层类别；自己带着子类别的也不能移。
+        """
+        cid = self._current_id()
+        if cid is None:
+            return
+        node = self._find_node(cid)
+        if node is None:
+            return
+        cat = node["cat"]
+
+        if node["children"]:
+            QMessageBox.information(
+                self, "移不了",
+                f"「{cat.name}」下面还有 {len(node['children'])} 个子类别，"
+                f"不能再被移进别的类别（否则就成三级了）。\n\n"
+                f"想移的话，先把它的子类别移走或删掉。",
+            )
+            return
+
+        # 候选：所有顶层类别（排除自己）+ 顶层
+        options = ["（顶层）"]
+        ids: list[int | None] = [None]
+        for n in self._tree:
+            if n["cat"].id == cid:
+                continue
+            options.append(n["cat"].name)
+            ids.append(n["cat"].id)
+
+        if len(options) == 1:
+            QMessageBox.information(self, "没地方可移", "现在还没有别的顶层类别可以当父。")
+            return
+
+        cur_idx = 0
+        if cat.parent_id is not None:
+            for i, pid in enumerate(ids):
+                if pid == cat.parent_id:
+                    cur_idx = i
+                    break
+
+        choice, ok = QInputDialog.getItem(
+            self, "移动到…", f"把「{cat.name}」移到：", options, cur_idx, False
+        )
+        if not ok:
+            return
+        target = ids[options.index(choice)]
+
+        if target == cat.parent_id:
+            return          # 没变，什么都不用做
+        try:
+            with SessionLocal() as db:
+                timer_svc.move_category(db, cid, target)
+        except ValueError as e:
+            QMessageBox.warning(self, "没能移动", str(e))
+            return
+        self.refresh(select_id=cid)
+
     def _on_delete(self) -> None:
         cid = self._current_id()
         if cid is None:
             return
-        entry = next((c for c in self._categories if c[0].id == cid), None)
-        if entry is None:
+        node = self._find_node(cid)
+        if node is None:
             return
-        cat, total = entry
+        cat = node["cat"]
+        kids = node["children"]
 
         with SessionLocal() as db:
             n_sessions, seconds = timer_svc.category_stats(db, cid)
 
+        msg = f"「{cat.name}」"
         if n_sessions:
-            msg = (
-                f"「{cat.name}」有 {n_sessions} 条学习记录，共 {fmt_hours(seconds)}。\n\n"
-                f"删除会把这些记录和 AI 整理出来的段落、关键词**一并清掉**，且无法恢复。\n\n"
-                f"确定要删吗？"
+            msg += (
+                f"有 {n_sessions} 条学习记录，共 {fmt_hours(seconds)}。\n\n"
+                f"删除会把这些记录和 AI 整理出来的段落、关键词**一并清掉**，且无法恢复。"
             )
+        if kids:
+            names = "、".join(k["cat"].name for k in kids)
+            msg += (
+                f"\n\n它下面还有 {len(kids)} 个子类别（{names}）。\n"
+                f"这些子类别会被**移到顶层**，它们自己的学习记录一条都不会丢。"
+            )
+        if not n_sessions and not kids:
+            msg += "确定删除吗？"
         else:
-            msg = f"确定删除「{cat.name}」吗？"
+            msg += "\n\n确定要删吗？"
 
         box = QMessageBox(self)
         box.setWindowTitle("删除类别")
         box.setText(msg)
-        box.setIcon(QMessageBox.Warning if n_sessions else QMessageBox.Question)
+        box.setIcon(QMessageBox.Warning if n_sessions or kids else QMessageBox.Question)
         box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         box.setDefaultButton(QMessageBox.No)
         if box.exec_() != QMessageBox.Yes:
@@ -656,20 +865,26 @@ class Dashboard(QWidget):
 
         try:
             with SessionLocal() as db:
-                timer_svc.delete_category(db, cid, force=True)
+                promoted = timer_svc.delete_category(db, cid, force=True)
         except ValueError as e:
             QMessageBox.warning(self, "没能删除", str(e))
             return
+
+        if promoted:
+            QMessageBox.information(
+                self, "子类别保住了",
+                "这些子类别已经移到顶层，学习记录都在：\n  " + "\n  ".join(promoted),
+            )
         self.refresh()
 
     def _on_rename(self) -> None:
         cid = self._current_id()
         if cid is None:
             return
-        entry = next((c for c in self._categories if c[0].id == cid), None)
-        if entry is None:
+        node = self._find_node(cid)
+        if node is None:
             return
-        old_name = entry[0].name
+        old_name = node["cat"].name
 
         name, ok = QInputDialog.getText(self, "重命名类别", "新的类别名", text=old_name)
         if not ok or not name.strip():
@@ -689,12 +904,24 @@ class Dashboard(QWidget):
         self.cat_list.setCurrentItem(hit)
 
         cid = self._current_id()
-        entry = next((c for c in self._categories if c[0].id == cid), None)
-        pinned = entry[0].is_pinned if entry else False
+        node = self._find_node(cid) if cid is not None else None
+        if node is None:
+            return
+        is_group = bool(node["children"])
+        is_child = hit.parent() is not None
+        pinned = node["cat"].is_pinned
 
         menu = QMenu(self)
         menu.setStyleSheet(MENU_QSS)
-        menu.addAction("取消置顶" if pinned else "📌 置顶", self._on_toggle_pin)
+
+        # 子类别不能置顶（跟着父走）
+        act_pin = menu.addAction("取消置顶" if pinned else "📌 置顶", self._on_toggle_pin)
+        act_pin.setEnabled(not is_child)
+
+        menu.addAction("➕ 新建子类别", self._on_add_child).setEnabled(not is_group)
+        act_move = menu.addAction("📁 移动到…", self._on_move)
+        act_move.setEnabled(not is_group)
+
         menu.addSeparator()
         menu.addAction("重命名", self._on_rename)
         menu.addAction("删除", self._on_delete)
