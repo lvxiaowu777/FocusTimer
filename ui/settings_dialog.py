@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from config import __version__
 from db.database import SessionLocal
 from services import settings as settings_svc
 
@@ -30,6 +31,7 @@ QDialog { background: #ffffff; }
 QLabel { color: #374151; font-size: 12px; }
 QLabel#title { font-size: 15px; font-weight: bold; color: #1f2937; }
 QLabel#hint  { color: #9ca3af; font-size: 11px; }
+QLabel#version { color: #c0c4cc; font-size: 10px; }
 QCheckBox { color: #374151; font-size: 12px; spacing: 8px; }
 QSpinBox {
     border: 1px solid #e5e7eb; border-radius: 6px;
@@ -96,6 +98,10 @@ class SettingsDialog(QDialog):
         self.hint.setWordWrap(True)
         root.addWidget(self.hint)
         self._refresh_hint()
+
+        self.version = QLabel(f"FocusTimer v{__version__}")
+        self.version.setObjectName("version")
+        root.addWidget(self.version)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")

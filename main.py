@@ -35,6 +35,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from config import __version__
 from db.database import SessionLocal, init_db
 from db.models import SessionStatus
 from services import settings as settings_svc
@@ -508,6 +509,8 @@ def signal_existing_instance(timeout_ms: int = 400, attempts: int = 6) -> bool:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    app.setApplicationName("FocusTimer")
+    app.setApplicationVersion(__version__)
     app.setQuitOnLastWindowClosed(False)      # 关看板不等于退出
 
     # ★ 单实例必须在 init_db() 之前 —— 第二个实例不该白连一次数据库
