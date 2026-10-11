@@ -28,6 +28,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -246,6 +247,39 @@ def _write_dev_env(built: Path) -> str:
     return note
 
 
+def _rescue_dist_data() -> tuple[str, int]:
+    """
+    清空 dist/ 之前，先看看里面有没有还没搬走的学习记录，有就另存一份。
+
+    ★ 为什么必须做这件事：
+      exe 把 SQLite 数据存在**自己旁边**，而 dist/ 是构建产物、每次打包都被整个删掉。
+      要是从 dist/ 里直接双击过那个 exe 并记了东西，记录会在下次打包时
+      悄无声息地消失 —— 实测就这么丢过。
+
+    返回 (另存到哪, 有多少条记录)。没有数据就是 ("", 0)。
+    """
+    candidates = [DIST / "focus_timer.db", DIST / "FocusTimer" / "focus_timer.db"]
+    db = next((p for p in candidates if p.exists()), None)
+    if db is None:
+        return ("", 0)
+
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        n = int(con.execute("SELECT COUNT(*) FROM `session`").fetchone()[0])
+        con.close()
+    except Exception:                            # noqa: BLE001
+        n = -1          # 读不出来就当里面有东西，保守起见先备份
+
+    if n == 0:
+        return ("", 0)  # 空库，直接删掉没关系
+
+    dst = ROOT / f"focus_timer_rescued_{datetime.now():%Y%m%d_%H%M%S}.db"
+    shutil.copy2(db, dst)
+    return (str(dst), n)
+
+
 def main() -> int:
     release = "--release" in sys.argv
     if release:
@@ -255,9 +289,21 @@ def main() -> int:
     else:
         onefile = "--dir" not in sys.argv
 
-    for d in (DIST, BUILD):
-        if d.exists():
-            shutil.rmtree(d, ignore_errors=True)
+    # —— 清空 dist/（顺带把里面的数据救出来）——
+    if DIST.exists():
+        rescued, n = _rescue_dist_data()
+        shutil.rmtree(DIST, ignore_errors=True)
+        if rescued:
+            print("!" * 62)
+            print(f"⚠  dist/ 里有 {n} 条学习记录还没搬走，已经先另存一份：")
+            print(f"     {rescued}")
+            print()
+            print("   原因：exe 把数据存在自己旁边，而 dist/ 每次打包都会整个清空。")
+            print("   以后想留着数据用 exe，请用不带 --release 打的包 ——")
+            print("   它的 .env 指向项目根目录的 focus_timer.db，重建不会丢。")
+            print("!" * 62)
+    if BUILD.exists():
+        shutil.rmtree(BUILD, ignore_errors=True)
 
     code = build(onefile=onefile)
     if code != 0:
@@ -278,16 +324,21 @@ def main() -> int:
         print("  对方解压后双击 exe 即可，默认用 SQLite，不需要装 MySQL。")
         print("  要把压缩包上传到 GitHub Release 的话，记得先确认里面没有")
         print("  ai_config.json（那个文件里有你的 API Key）。")
+
+        # ★ dist/ 到这里只是个中转站，内容已经复制进 release/ 了。
+        #   留着它反而是个坑：里面那个 exe 旁边**没有 .env**，一跑就把数据
+        #   写进 dist/，下次打包连库一起被清掉 —— 实测就是这么丢的数据。
+        if DIST.exists():
+            shutil.rmtree(DIST, ignore_errors=True)
+            print("\n已清理中转目录 dist/（内容已经在 release/ 里了）")
     else:
         print("打包完成")
         print("=" * 56)
         print(f"产物: {built}")
-        # 开发版故意抄一份本机 .env：这样 exe 连的是你真实的数据库，
-        # 开发版：让 exe 和源码用**同一份数据**。
-        # **这个产物不要外发**（.env 里有本机信息）。
         print("  " + _write_dev_env(built))
         print("  " + _copy_assets(built))
         print("\n用法：双击 exe。整个文件夹一起拷走才有效。")
+        print("      数据存在项目根目录的 focus_timer.db，重新打包不会丢。")
 
     # 清掉中间产物 —— build/ 里也有个同名 exe，但它缺依赖，永远打不开，
     # 留着只会让人点错。
