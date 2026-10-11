@@ -19,11 +19,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMenu,
@@ -41,68 +43,104 @@ from PyQt5.QtWidgets import (
 from db.database import SessionLocal
 from services import llm as llm_svc
 from services import timer as timer_svc
+from ui import theme
 
 # 树控件里存自定义数据的角色
 ROLE_ID = Qt.UserRole              # 类别 id
 ROLE_IS_GROUP = Qt.UserRole + 1    # 是不是「分组」（有子类别，不能计时）
 
-QSS = """
+QSS_TEMPLATE = """
 QWidget#root { background: #ffffff; }
-QLabel#h1 { color: #1f2937; font-size: 15px; font-weight: bold; }
-QLabel#h2 { color: #6b7280; font-size: 11px; }
-QLabel#total { color: #3b82f6; font-size: 22px; font-weight: bold; }
+
+/* —— 顶部 —— */
+QLabel#h1 { color: INK; font-size: 16px; font-weight: 600; }
+QLabel#h2 { color: MUTED; font-size: 11.5px; }
 QLabel#today {
-    color: #1d4ed8; font-size: 12px; font-weight: bold;
-    background: #eff6ff; border-radius: 11px; padding: 5px 13px;
+    color: ACCENT; font-size: 11.5px; font-weight: 600;
+    background: ACCENT_SOFT; border-radius: 10px; padding: 5px 12px;
 }
+QLabel#total { color: INK; font-size: 21px; font-weight: 600; }
+QLabel#unit  { color: FAINT; font-size: 12px; }
+
+/* —— 左：类别树 —— */
 QTreeWidget {
-    border: 1px solid #e5e7eb; border-radius: 8px;
-    font-size: 12px; color: #374151; outline: none; padding: 4px;
-    background: #ffffff;
+    border: none; background: #ffffff;
+    font-size: 13px; color: INK_SOFT; outline: none; padding: 0;
 }
-QTreeWidget::item { padding: 7px 4px; border-radius: 6px; min-height: 18px; }
-QTreeWidget::item:selected { background: #eff6ff; color: #1d4ed8; }
-QTreeWidget::item:hover { background: #f9fafb; }
+QTreeWidget::item {
+    padding: 8px 6px; border-radius: 7px; min-height: 16px;
+    border: none;
+}
+QTreeWidget::item:selected { background: ACCENT_SOFT; color: ACCENT; }
+QTreeWidget::item:hover { background: BG_SOFT; }
 QTreeWidget::branch { background: transparent; }
+
+/* —— 按钮 —— */
 QPushButton {
-    border: 1px solid #e5e7eb; border-radius: 6px;
-    padding: 5px 12px; font-size: 11px; color: #374151; background: #ffffff;
+    border: 1px solid LINE_SOFT; border-radius: 7px;
+    padding: 6px 13px; font-size: 12px; color: INK_SOFT; background: #ffffff;
 }
-QPushButton:hover { background: #f9fafb; border-color: #d1d5db; }
-QPushButton:disabled { color: #c0c4cc; background: #fafafa; }
-QPushButton#primary { background: #3b82f6; color: #fff; border: none; }
-QPushButton#primary:hover { background: #2563eb; }
+QPushButton:hover { background: BG_SOFT; border-color: GHOST; }
+QPushButton:disabled { color: GHOST; background: #ffffff; border-color: LINE; }
+QPushButton#primary {
+    background: ACCENT; color: #ffffff; border: 1px solid ACCENT; font-weight: 600;
+}
+QPushButton#primary:hover { background: ACCENT_HOVER; border-color: ACCENT_HOVER; }
+QPushButton#primary:disabled { background: #ffffff; color: GHOST; border-color: LINE; }
 QPushButton#link {
-    border: none; background: transparent; color: #3b82f6;
-    font-size: 11px; padding: 0;
+    border: none; background: transparent; color: ACCENT;
+    font-size: 11.5px; padding: 0; text-align: left;
 }
-QPushButton#link:hover { color: #2563eb; }
+QPushButton#link:hover { color: ACCENT_HOVER; }
+
+/* —— 右：段落卡片 —— */
 QScrollArea#scroll { border: none; background: #ffffff; }
 QWidget#cardsHost { background: #ffffff; }
-QFrame#card { background: #fafafa; border: 1px solid #e5e7eb; border-radius: 8px; }
-QLabel#cardWhen { color: #3b82f6; font-size: 11px; font-weight: bold; }
+QFrame#card {
+    background: #ffffff;
+    border: 1px solid LINE;
+    border-radius: 10px;
+}
+QFrame#card:hover { border-color: LINE_SOFT; }
+QLabel#cardWhen { color: MUTED; font-size: 11.5px; }
 QLabel#cardCat  {
-    color: #6d28d9; background: #f3e8ff;
-    border-radius: 8px; padding: 1px 7px; font-size: 10px; font-weight: bold;
+    color: TAG; background: TAG_SOFT;
+    border-radius: 9px; padding: 2px 8px; font-size: 10.5px; font-weight: 600;
 }
-QLabel#cardStat { color: #6b7280; font-size: 11px; }
+QLabel#cardStat { color: MUTED; font-size: 11.5px; }
 QLabel#cardTag  {
-    color: #b45309; background: #fef3c7;
-    border-radius: 8px; padding: 1px 7px; font-size: 10px;
+    color: WARN; background: WARN_SOFT;
+    border-radius: 9px; padding: 2px 8px; font-size: 10.5px;
 }
-QLabel#cardBody { color: #1f2937; font-size: 12px; }
-QLabel#cardKw   { color: #6b7280; font-size: 11px; }
+QLabel#cardBody { color: INK_SOFT; font-size: 13px; line-height: 165%; }
+QLabel#cardKw   { color: MUTED; font-size: 11.5px; }
 QTextBrowser#viewer {
-    border: 1px solid #e5e7eb; border-radius: 8px;
-    background: #fafafa; padding: 8px; font-size: 13px; color: #1f2937;
+    border: 1px solid LINE; border-radius: 10px;
+    background: BG_SOFT; padding: 10px; font-size: 13.5px; color: INK_SOFT;
 }
 """
 
-MENU_QSS = (
-    "QMenu{background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:4px;}"
-    "QMenu::item{padding:6px 18px;border-radius:5px;font-size:12px;color:#1f2937;}"
-    "QMenu::item:selected{background:#eff6ff;color:#1d4ed8;}"
+
+def _palette_css(css: str) -> str:
+    """把模板里的颜色名换成真值（QSS 不支持变量，只能自己替换）。"""
+    return theme.palette_css(css)
+
+
+def build_qss() -> str:
+    """当前字号档下的完整样式表。字号档变了要重新调一次。"""
+    return theme.styled(QSS_TEMPLATE)
+
+MENU_TEMPLATE = (
+    "QMenu{background:#fff;border:1px solid LINE_SOFT;border-radius:9px;padding:5px;}"
+    "QMenu::item{padding:7px 20px;border-radius:6px;font-size:12.5px;color:INK_SOFT;}"
+    "QMenu::item:selected{background:ACCENT_SOFT;color:ACCENT;}"
+    "QMenu::item:disabled{color:GHOST;}"
+    "QMenu::separator{height:1px;background:LINE;margin:5px 8px;}"
 )
+
+
+def menu_qss() -> str:
+    return theme.qss(_palette_css(MENU_TEMPLATE))
 
 # 判断段落是不是 Markdown（行首 1~4 个 # + 空格）—— 决定用哪种方式渲染
 _MD_HEADING = re.compile(r"^\s{0,3}#{1,4}\s+\S", re.M)
@@ -113,6 +151,13 @@ def fmt_hours(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60} min"
     return f"{seconds / 3600:.1f} h"
+
+
+def hour_parts(seconds: int) -> tuple[str, str]:
+    """(数值, 单位) —— 大数字和单位分开排版才好看（见左下角那个合计）。"""
+    if seconds < 3600:
+        return str(seconds // 60), "min"
+    return f"{seconds / 3600:.1f}", "h"
 
 
 def fmt_duration(seconds: int) -> str:
@@ -155,17 +200,25 @@ class ParagraphViewer(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"{fmt_clock(rec['start_time'])} 的总结")
         self.resize(780, 640)
-        self.setStyleSheet(QSS)
+        self.setStyleSheet(build_qss())
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 14)
-        lay.setSpacing(10)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(12)
 
         head = QLabel(
-            f"{fmt_clock(rec['start_time'])} → {fmt_clock(rec['end_time'])}"
-            f"　　专注 {fmt_duration(rec['duration_seconds'])}"
-            f" · 休息 {fmt_duration(rec['rest_seconds'])}"
+            f'<span style="color:{theme.MUTED}">'
+            f'{fmt_clock(rec["start_time"])} → {fmt_clock(rec["end_time"])}</span>'
+            f'<span style="color:{theme.GHOST}">　·　</span>'
+            f'<span style="color:{theme.MUTED}">专注</span>'
+            f'<span style="color:{theme.INK};font-weight:600">'
+            f'  {fmt_duration(rec["duration_seconds"])}</span>'
+            f'<span style="color:{theme.GHOST}">　·　</span>'
+            f'<span style="color:{theme.MUTED}">休息</span>'
+            f'<span style="color:{theme.INK};font-weight:600">'
+            f'  {fmt_duration(rec["rest_seconds"])}</span>'
         )
+        head.setTextFormat(Qt.RichText)
         head.setObjectName("cardStat")
         lay.addWidget(head)
 
@@ -180,7 +233,16 @@ class ParagraphViewer(QDialog):
         lay.addWidget(view)
 
         if rec["keywords"]:
-            kw = QLabel("关键词：" + " · ".join(rec["keywords"]))
+            sep = f'<span style="color:{theme.GHOST}"> · </span>'
+            words = sep.join(
+                f'<span style="color:{theme.MUTED}">{k}</span>'
+                for k in rec["keywords"]
+            )
+            kw = QLabel(
+                f'<span style="color:{theme.FAINT}">关键词</span>'
+                f'<span style="color:{theme.GHOST}">　</span>{words}'
+            )
+            kw.setTextFormat(Qt.RichText)
             kw.setObjectName("cardKw")
             kw.setWordWrap(True)
             lay.addWidget(kw)
@@ -214,12 +276,13 @@ class RecordCard(QFrame):
         self._expanded = False
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 10)
-        root.setSpacing(6)
+        root.setContentsMargins(16, 13, 16, 13)
+        root.setSpacing(9)
 
-        # —— 时间行：开始 → 结束 · 专注 · 休息 ——
+        # —— 时间行 ——
+        # 左边时间（次要信息，灰），右边时长（数字要能一眼扫到，所以加重）
         head = QHBoxLayout()
-        head.setSpacing(8)
+        head.setSpacing(10)
 
         # 看「分组」时记录来自不同子类别，得标出来是哪一条
         if show_category and rec.get("category_name"):
@@ -231,19 +294,27 @@ class RecordCard(QFrame):
         when.setObjectName("cardWhen")
         head.addWidget(when)
 
-        stat = QLabel(
-            f"专注 {fmt_duration(rec['duration_seconds'])}"
-            f" · 休息 {fmt_duration(rec['rest_seconds'])}"
-        )
-        stat.setObjectName("cardStat")
-        head.addWidget(stat)
-
         if not rec["polished_text"]:
-            tag = QLabel("未整理 · 显示原文")
+            tag = QLabel("未整理")
             tag.setObjectName("cardTag")
             head.addWidget(tag)
 
         head.addStretch()
+
+        # 数字用富文本加重、标签保持灰 —— 层次拉开了才好扫
+        stat = QLabel(
+            f'<span style="color:{theme.MUTED}">专注</span>'
+            f'<span style="color:{theme.INK};font-weight:600">'
+            f'  {fmt_duration(rec["duration_seconds"])}</span>'
+            f'<span style="color:{theme.GHOST}">　·　</span>'
+            f'<span style="color:{theme.MUTED}">休息</span>'
+            f'<span style="color:{theme.INK};font-weight:600">'
+            f'  {fmt_duration(rec["rest_seconds"])}</span>'
+        )
+        stat.setTextFormat(Qt.RichText)
+        stat.setObjectName("cardStat")
+        head.addWidget(stat)
+
         root.addLayout(head)
 
         # —— 正文 ——
@@ -269,8 +340,18 @@ class RecordCard(QFrame):
         self._render_body()
 
         # —— 关键词 ——
+        # 「关键词」当标签（很淡），词条用次要灰，中间细点分隔
         if rec["keywords"]:
-            kw = QLabel("关键词：" + " · ".join(rec["keywords"]))
+            sep = f'<span style="color:{theme.GHOST}"> · </span>'
+            words = sep.join(
+                f'<span style="color:{theme.MUTED}">{k}</span>'
+                for k in rec["keywords"]
+            )
+            kw = QLabel(
+                f'<span style="color:{theme.FAINT}">关键词</span>'
+                f'<span style="color:{theme.GHOST}">　</span>{words}'
+            )
+            kw.setTextFormat(Qt.RichText)
             kw.setObjectName("cardKw")
             kw.setWordWrap(True)
             root.addWidget(kw)
@@ -297,7 +378,7 @@ class RecordCard(QFrame):
 
     def contextMenuEvent(self, event):  # noqa: N802
         menu = QMenu(self)
-        menu.setStyleSheet(MENU_QSS)
+        menu.setStyleSheet(menu_qss())
         menu.addAction("🔄 重新整理这一段", self._repolish)
         menu.exec_(event.globalPos())
 
@@ -313,12 +394,12 @@ class Dashboard(QWidget):
         super().__init__(parent)
         self.setObjectName("root")
         self.setWindowTitle("学习看板")
-        self.setStyleSheet(QSS)
+        self.setStyleSheet(build_qss())
         self.resize(880, 560)
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 16, 18, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(14)
 
         head = QHBoxLayout()
         h1 = QLabel("学习看板")
@@ -333,27 +414,38 @@ class Dashboard(QWidget):
         root.addLayout(head)
 
         cols = QHBoxLayout()
-        cols.setSpacing(16)
+        cols.setSpacing(22)
 
         # ───────────── 左：类别 ─────────────
         left = QVBoxLayout()
-        left.setSpacing(6)
+        left.setSpacing(8)
 
-        lab1 = QLabel("类别 · 累计专注（右键：置顶 / 建子类别 / 移动）")
+        lab1 = QLabel("类别")
         lab1.setObjectName("h2")
         left.addWidget(lab1)
 
-        # 二级目录 → 用树。父类别是「分组」，它的时长是自己 + 子类别的合计。
+        # 二级目录 → 用树。父类别是「分组」，时长是自己 + 子类别的合计。
+        # 两列：左边名字，右边时长右对齐 —— 比在名字后面拼 "    ·    3.1 h" 干净得多。
         self.cat_list = QTreeWidget()
         self.cat_list.setHeaderHidden(True)
-        self.cat_list.setColumnCount(1)
-        self.cat_list.setIndentation(14)
+        self.cat_list.setColumnCount(2)
+        self.cat_list.setIndentation(theme.px(14))
         self.cat_list.setExpandsOnDoubleClick(False)
         self.cat_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.cat_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.cat_list.customContextMenuRequested.connect(self._on_context_menu)
         self.cat_list.currentItemChanged.connect(self._on_selection_changed)
         self.cat_list.itemDoubleClicked.connect(self._on_item_double_clicked)
+        self.cat_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 字号档调大时左栏得跟着变宽。210 是量出来的：字号档 130% 时
+        # 「Agent项目-mewagent」实际要 ~186px + 缩进 18 + 时长列 86，约 300px。
+        self.cat_list.setMinimumWidth(theme.px(232))
+        # 第 0 列（名字）吃掉剩余宽度，第 1 列（时长）固定宽并右对齐
+        hdr = self.cat_list.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.cat_list.setColumnWidth(1, theme.px(66))
         left.addWidget(self.cat_list)
 
         self.total_label = QLabel("—")
@@ -383,16 +475,16 @@ class Dashboard(QWidget):
 
         # ───────────── 右：段落卡片 ─────────────
         right = QVBoxLayout()
-        right.setSpacing(6)
+        right.setSpacing(10)
 
         head2 = QHBoxLayout()
         head2.setSpacing(8)
-        self.items_title = QLabel("学过什么")
+        self.items_title = QLabel("")
         self.items_title.setObjectName("h2")
         head2.addWidget(self.items_title)
         head2.addStretch()
 
-        self.btn_polish_all = QPushButton("✨ 批量整理")
+        self.btn_polish_all = QPushButton("批量整理")
         self.btn_polish_all.setToolTip(
             "把还没整理过的记录一次性交给 AI 整理。\n"
             "历史记录和之前调用失败的都算在内。"
@@ -409,8 +501,8 @@ class Dashboard(QWidget):
         self.cards_host = QWidget()
         self.cards_host.setObjectName("cardsHost")
         self.cards_layout = QVBoxLayout(self.cards_host)
-        self.cards_layout.setContentsMargins(0, 0, 6, 0)
-        self.cards_layout.setSpacing(8)
+        self.cards_layout.setContentsMargins(0, 0, 8, 0)
+        self.cards_layout.setSpacing(theme.px(10))
         self.cards_layout.addStretch()
         self.scroll.setWidget(self.cards_host)
 
@@ -442,6 +534,22 @@ class Dashboard(QWidget):
         """
         event.ignore()
         self.hide()
+
+    def reapply_theme(self) -> None:
+        """
+        字号档变了之后重新套一遍样式。
+
+        看板是常驻对象，不像对话框那样每次新建 —— 所以得主动通知它。
+        重新 setStyleSheet 会让 Qt 把新样式刷到这个控件**及其所有子控件**上；
+        卡片间距、树列宽这些是代码里算的，也得跟着重设。
+        """
+        self.setStyleSheet(build_qss())
+        self.cat_list.setIndentation(theme.px(14))
+        self.cat_list.setMinimumWidth(theme.px(232))
+        self.cat_list.setColumnWidth(1, theme.px(66))
+        self.cards_layout.setSpacing(theme.px(10))
+        # 卡片是按字号算过的尺寸画的，重建一遍最省心
+        self.refresh(select_id=self._current_id())
 
     # ────────────────────────── 数据 ──────────────────────────
 
@@ -486,7 +594,7 @@ class Dashboard(QWidget):
 
         self.btn_polish_all.setEnabled(pending > 0 and not self._job["running"])
         self.btn_polish_all.setText(
-            f"✨ 批量整理 ({pending})" if pending else "✨ 批量整理"
+            f"批量整理 {pending}" if pending else "批量整理"
         )
 
         if select_id is None and self._tree:
@@ -500,27 +608,32 @@ class Dashboard(QWidget):
         for node in self._tree:
             cat, total = node["cat"], node["total"]
             is_group = bool(node["children"])
-            mark = "📌 " if cat.is_pinned else ""
-            label = f"{mark}{cat.name}    ·    {fmt_hours(total)}"
+            name = f"📌 {cat.name}" if cat.is_pinned else cat.name
             if is_group:
-                # 用最短的说法，否则左栏窄的时候会被省略号吃掉后半截
-                label += f"    ·    {len(node['children'])} 子项"
+                # 折起来的时候也得知道下面有几个，所以挂在名字后面（用浅色括号）
+                name += f"  ({len(node['children'])})"
 
-            item = QTreeWidgetItem([label])
+            item = QTreeWidgetItem([name, fmt_hours(total)])
             item.setData(0, ROLE_ID, cat.id)
             item.setData(0, ROLE_IS_GROUP, is_group)
             item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            item.setForeground(1, QBrush(QColor(theme.FAINT)))
+            # 左栏窄的时候名字会被省略号截掉，tooltip 兜底显示全名
+            tip = f"{cat.name}　·　{fmt_hours(total)}"
             if is_group:
-                item.setToolTip(0, "这是分组，不能直接计时 —— 请选它下面的子类别")
+                tip += "\n这是分组，不能直接计时 —— 请选它下面的子类别"
+            item.setToolTip(0, tip)
             self.cat_list.addTopLevelItem(item)
 
             for ch in node["children"]:
-                sub = QTreeWidgetItem(
-                    [f"{ch['cat'].name}    ·    {fmt_hours(ch['total'])}"]
-                )
+                sub = QTreeWidgetItem([ch["cat"].name, fmt_hours(ch["total"])])
                 sub.setData(0, ROLE_ID, ch["cat"].id)
                 sub.setData(0, ROLE_IS_GROUP, False)
                 sub.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                sub.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                sub.setForeground(1, QBrush(QColor(theme.FAINT)))
+                sub.setToolTip(0, f"{ch['cat'].name}　·　{fmt_hours(ch['total'])}")
                 item.addChild(sub)
 
             # 有子类别的默认展开；用户手动折起来的保持折起
@@ -546,6 +659,18 @@ class Dashboard(QWidget):
             self.cat_list.setCurrentItem(pick)
             self._on_selection_changed()
 
+    def _set_total(self, seconds: int, prefix: str = "") -> None:
+        """左下角那个大合计 —— 数字大、单位小，层次分明。"""
+        num, unit = hour_parts(seconds)
+        self.total_label.setTextFormat(Qt.RichText)
+        self.total_label.setText(
+            f'<span style="color:{theme.FAINT};font-size:{theme.px(12)}px;'
+            f'font-weight:400">{prefix}</span>'
+            f'{num}'
+            f'<span style="color:{theme.FAINT};font-size:{theme.px(12)}px;'
+            f'font-weight:400"> {unit}</span>'
+        )
+
     def _on_selection_changed(self, *_) -> None:
         cid = self._current_id()
         if cid is None:
@@ -561,7 +686,7 @@ class Dashboard(QWidget):
         is_group = bool(node["children"])
 
         # 分组显示合计；子类别/叶子显示自己的
-        self.total_label.setText(f"共 {fmt_hours(node['total'])}")
+        self._set_total(node["total"], prefix="共 ")
 
         with SessionLocal() as db:
             records = timer_svc.category_records(
@@ -570,11 +695,11 @@ class Dashboard(QWidget):
 
         if is_group:
             self.items_title.setText(
-                f"「{cat.name}」分组 · {len(node['children'])} 个子类别 · "
-                f"{len(records)} 次专注（含子类别）"
+                f"{cat.name}  ·  分组  ·  {len(node['children'])} 个子类别  ·  "
+                f"{len(records)} 次专注"
             )
         else:
-            self.items_title.setText(f"「{cat.name}」· {len(records)} 次专注")
+            self.items_title.setText(f"{cat.name}  ·  {len(records)} 次专注")
         self._rebuild_cards(records, show_category=is_group)
 
     def _on_item_double_clicked(self, item, _column) -> None:
@@ -658,7 +783,7 @@ class Dashboard(QWidget):
 
         self._job_timer.stop()
         ok, total = job["ok"], job["total"]
-        self.btn_polish_all.setText("✨ 批量整理")
+        self.btn_polish_all.setText("批量整理")
 
         if ok == 0:
             QMessageBox.warning(
@@ -912,7 +1037,7 @@ class Dashboard(QWidget):
         pinned = node["cat"].is_pinned
 
         menu = QMenu(self)
-        menu.setStyleSheet(MENU_QSS)
+        menu.setStyleSheet(menu_qss())
 
         # 子类别不能置顶（跟着父走）
         act_pin = menu.addAction("取消置顶" if pinned else "📌 置顶", self._on_toggle_pin)

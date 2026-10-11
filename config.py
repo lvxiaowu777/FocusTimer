@@ -26,7 +26,7 @@ os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 # —— 版本号 ——
 # 语义化版本 MAJOR.MINOR.PATCH：加功能升 MINOR，修 bug 升 PATCH。
 # 打包成 exe 后靠它分辨新旧，也在「设置」窗口里显示。
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包后：__file__ 指向临时解压目录，

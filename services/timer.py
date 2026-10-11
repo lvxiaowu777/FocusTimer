@@ -42,7 +42,16 @@ def study_seconds(
            整段算学习。所以点「结束」之后弹窗写多久都算，不设上限。
 
     纯内存计算、不查库：写总结弹窗上每秒往上跳的那个数就是它。
+
+    ★ 已经定死过时长的记录（duration_seconds 有值）直接返回那个值。
+      不加这道闸的话，对一个**已结束**的记录调它，会从 start_time 一路算到
+      「现在」—— 实测一条 2026-09-15 结束的记录算出了 178 万秒（≈495 小时），
+      而它的总跨度只有 179767 秒。虽然现有调用方都自己判过了，
+      但这个坑太容易踩，直接在源头堵掉。
     """
+    if session.duration_seconds is not None:
+        return int(session.duration_seconds)
+
     now = now or datetime.now()
     stopped_at = session.review_started_at
     upto = stopped_at or now
@@ -70,9 +79,9 @@ def is_break_now(
     return phase, remain
 
 
-def rest_seconds(session: FocusSession) -> int:
+def break_seconds(session: FocusSession) -> int:
     """
-    这段专注里**落在休息段的秒数** —— 纯派生，不存库、不查库。
+    这段专注里**落在周期休息段的秒数**（不含手动暂停）—— 纯派生，不存库、不查库。
 
     怎么来的（和 study_seconds 的算法严丝合缝）：
 
@@ -85,7 +94,7 @@ def rest_seconds(session: FocusSession) -> int:
       duration_seconds 是**当时按当时的设置**定死的。如果休息时长现算，
       用户以后把「专注 25 分 / 休息 5 分」改成别的，所有历史记录的休息时间
       会跟着一起变 —— 那是篡改历史。而上面这个式子只用已经定死的数，
-      算出来永远一致。顺带好处：17 条早于本次改动的历史记录也能直接算出休息时间。
+      算出来永远一致。顺带好处：早于本次改动的历史记录也能直接算出休息时间。
 
     没结束（end_time / duration_seconds 为空）就返回 0。
     """
@@ -95,6 +104,22 @@ def rest_seconds(session: FocusSession) -> int:
     span = (session.end_time - session.start_time).total_seconds()
     rest = span - max(0, int(session.paused_seconds or 0)) - int(session.duration_seconds)
     return max(0, int(rest))
+
+
+def rest_seconds(session: FocusSession) -> int:
+    """
+    **界面上显示的「休息」** = 周期休息 + 手动暂停。
+
+    为什么不分开显示：对用户来说，一次专注里除了「在学习」的时间，剩下的
+    都是「没在学」—— 再分成「周期休息」和「手动暂停」两栏是多想一层。
+    并进来还有个好处，三个数能对上：
+
+        结束时间 − 开始时间 = 专注 + 休息
+
+    （暂停的时间本来就不算进专注，见 study_seconds；所以它天然属于「休息」这一侧。）
+    """
+    paused = max(0, int(session.paused_seconds or 0))
+    return break_seconds(session) + paused
 
 
 def today_total(db: Session) -> int:
@@ -692,7 +717,12 @@ def category_records(
             "start_time": s.start_time,
             "end_time": s.end_time,
             "duration_seconds": s.duration_seconds or 0,
+            # ★ 这个 rest_seconds 是**界面显示用的「休息」**，已经把手动暂停并进去了
+            #   （= 周期休息 + 暂停）。所以卡片上不会单独出现「暂停」这一栏。
+            #   想拿纯周期休息用 break_seconds()。
             "rest_seconds": rest_seconds(s),
+            "break_seconds": break_seconds(s),
+            "paused_seconds": max(0, int(s.paused_seconds or 0)),
             "polished_text": s.polished_text,
             "raw_text": s.raw_text or "",
             "keywords": by_session.get(s.id, []),

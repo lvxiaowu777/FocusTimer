@@ -26,21 +26,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PyQt5.QtCore import QPoint, QRectF, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath
 from PyQt5.QtWidgets import QAction, QApplication, QMenu, QPushButton, QWidget
 
 from config import WINDOW_SIZE
+from ui import theme
 
-# —— 浅色配色 ——
+# —— 配色（跟 ui/theme 一套，别各写各的）——
 BG          = QColor(255, 255, 255, 236)   # 白底，微透
-BORDER      = QColor(0, 0, 0, 26)          # 淡描边
-TEXT_MAIN   = QColor(31, 41, 55)           # 深灰，数字
-TEXT_SUB    = QColor(107, 114, 128)        # 次级文字
-ACCENT      = QColor(59, 130, 246)         # 蓝，专注进度弧
-ACCENT_DIM  = QColor(191, 219, 254)        # 淡蓝，弧底
-BREAK       = QColor(34, 197, 94)          # 绿，休息进度弧
-BREAK_DIM   = QColor(187, 247, 208)        # 淡绿，休息弧底
-PAUSE       = QColor(217, 119, 6)          # 琥珀，暂停计时
+BORDER      = QColor(0, 0, 0, 24)          # 淡描边
+TEXT_MAIN   = QColor(theme.INK)            # 数字
+TEXT_SUB    = QColor(theme.MUTED)          # 次级文字
+TEXT_FAINT  = QColor(theme.FAINT)          # 更淡
+ACCENT      = QColor(theme.ACCENT)         # 蓝，专注进度弧
+ACCENT_DIM  = QColor("#dbeafe")            # 淡蓝，弧底
+BREAK       = QColor("#16a34a")            # 绿，休息进度弧
+BREAK_DIM   = QColor("#dcfce7")            # 淡绿，休息弧底
+PAUSE       = QColor("#d97706")            # 琥珀，暂停计时
+
+# 字号基准（标准档下的 px）。小字加个上限：窗口只有 160px，
+# 字号档拉到「特大」时说明文字会宽到放不下，截断成省略号更难看。
+F_MAIN = 30
+F_MAIN_HOURS = 24          # 超过 1 小时用这个，免得撑出窗口
+F_SMALL = 10
+F_SMALL_MAX = 12
 
 
 def _fmt_dur(seconds: int) -> str:
@@ -49,6 +58,12 @@ def _fmt_dur(seconds: int) -> str:
     h, rem = divmod(t, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else "%02d:%02d" % (m, s)
+
+
+def _elide(text: str, font: QFont, width: float) -> str:
+    """放不下就截成省略号 —— 窗口是固定 160px，长类别名会顶出去。"""
+    fm = QFontMetrics(font)
+    return fm.elidedText(text, Qt.ElideRight, max(20, int(width)))
 
 
 class FloatingTimer(QWidget):
@@ -217,18 +232,20 @@ class FloatingTimer(QWidget):
         # —— 写总结中：计时还在跑，但周期计数已经停了 ——
         # 不画进度弧，大数字换成「已计入的学习时长」往上走，一眼能看出没停。
         if self.state == "pending_review":
-            f = QFont("Consolas")
-            f.setPixelSize(26 if self._study >= 3600 else 30)
-            f.setBold(True)
+            f = theme.qfont(
+                "Consolas", F_MAIN_HOURS if self._study >= 3600 else F_MAIN, bold=True
+            )
             p.setFont(f)
             p.setPen(ACCENT)
             p.drawText(band_main, Qt.AlignCenter, self._fmt_study())
 
-            f2 = QFont("Microsoft YaHei UI")
-            f2.setPixelSize(10)
+            f2 = theme.qfont("Microsoft YaHei UI", F_SMALL, max_px=F_SMALL_MAX)
             p.setFont(f2)
             p.setPen(TEXT_SUB)
-            p.drawText(band_sub, Qt.AlignCenter, "总结中 · %s" % self.category_name)
+            p.drawText(
+                band_sub, Qt.AlignCenter,
+                _elide("总结中 · %s" % self.category_name, f2, w - pad * 2),
+            )
 
             p.setPen(ACCENT)
             p.drawText(band_tip, Qt.AlignCenter, "计时继续")
@@ -263,22 +280,19 @@ class FloatingTimer(QWidget):
         # （这段专注累计暂停了多少在下面的小字里，两个数并存）
         if self.state == "paused":
             main = _fmt_dur(self._pause_current)
-            size = 24 if self._pause_current >= 3600 else 30
+            big = self._pause_current >= 3600
             color = PAUSE
         else:
             main = self._fmt()
-            size = 30
+            big = False
             color = TEXT_MAIN
-        f = QFont("Consolas")
-        f.setPixelSize(size)
-        f.setBold(True)
+        f = theme.qfont("Consolas", F_MAIN_HOURS if big else F_MAIN, bold=True)
         p.setFont(f)
         p.setPen(color)
         p.drawText(band_main, Qt.AlignCenter, main)
 
         # —— 副标题：阶段 · 类别 ——
-        f2 = QFont("Microsoft YaHei UI")
-        f2.setPixelSize(10)
+        f2 = theme.qfont("Microsoft YaHei UI", F_SMALL, max_px=F_SMALL_MAX)
         p.setFont(f2)
         p.setPen(TEXT_SUB)
         if self.state == "paused":
@@ -288,11 +302,10 @@ class FloatingTimer(QWidget):
             sub = "%s · %s" % (head, self.category_name)
         else:
             sub = "%s · %gh" % (self.category_name, self.total_hours)
-        p.drawText(band_sub, Qt.AlignCenter, sub)
+        p.drawText(band_sub, Qt.AlignCenter, _elide(sub, f2, w - pad * 2))
 
         # —— 状态提示 ——
-        f3 = QFont("Microsoft YaHei UI")
-        f3.setPixelSize(10)
+        f3 = theme.qfont("Microsoft YaHei UI", F_SMALL, max_px=F_SMALL_MAX)
         p.setFont(f3)
         # pending_review 在上面就 return 了，到不了这儿
         if self.state == "paused":
@@ -302,8 +315,8 @@ class FloatingTimer(QWidget):
         else:
             tip = None
         if tip:
-            p.setPen(TEXT_SUB)
-            p.drawText(band_tip, Qt.AlignCenter, tip)
+            p.setPen(TEXT_FAINT)
+            p.drawText(band_tip, Qt.AlignCenter, _elide(tip, f3, w - pad * 2))
 
         p.end()
 

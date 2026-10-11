@@ -40,44 +40,56 @@ from config import __version__
 from db.database import SessionLocal
 from services import llm as llm_svc
 from services import settings as settings_svc
+from ui import theme
 
-QSS = """
+QSS_TEMPLATE = """
 QDialog { background: #ffffff; }
-QLabel { color: #374151; font-size: 12px; }
-QLabel#title { font-size: 15px; font-weight: bold; color: #1f2937; }
-QLabel#hint  { color: #9ca3af; font-size: 11px; }
-QLabel#version { color: #c0c4cc; font-size: 10px; }
-QLabel#sect { font-size: 12px; font-weight: bold; color: #1f2937; }
-QLabel#note { color: #9ca3af; font-size: 11px; }
-QLabel#ok   { color: #15803d; font-size: 11px; font-weight: bold; }
-QLabel#bad  { color: #b91c1c; font-size: 11px; font-weight: bold; }
-QCheckBox { color: #374151; font-size: 12px; spacing: 8px; }
+QLabel { color: INK_SOFT; font-size: 12.5px; }
+QLabel#title { font-size: 14px; font-weight: 600; color: INK; }
+QLabel#hint  { color: FAINT; font-size: 11.5px; }
+QLabel#version { color: GHOST; font-size: 10.5px; }
+QLabel#sect { font-size: 12.5px; font-weight: 600; color: INK; }
+QLabel#note { color: FAINT; font-size: 11.5px; }
+QLabel#ok   { color: OK; font-size: 11.5px; font-weight: 600; }
+QLabel#bad  { color: BAD; font-size: 11.5px; font-weight: 600; }
+QCheckBox { color: INK_SOFT; font-size: 12.5px; spacing: 8px; }
 QSpinBox, QLineEdit, QComboBox {
-    border: 1px solid #e5e7eb; border-radius: 6px;
-    padding: 4px 6px; font-size: 12px; color: #1f2937;
-    background: #fafafa; min-height: 18px;
+    border: 1px solid LINE_SOFT; border-radius: 7px;
+    padding: 5px 8px; font-size: 12.5px; color: INK;
+    background: #ffffff; min-height: 18px;
 }
-QSpinBox { min-width: 80px; }
-QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: #3b82f6; background: #fff; }
-QLineEdit:disabled, QComboBox:disabled { color: #9ca3af; background: #f3f4f6; }
+QSpinBox { min-width: 84px; }
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
+    border-color: ACCENT; background: #ffffff;
+}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {
+    color: GHOST; background: BG_SOFT;
+}
+QComboBox::drop-down { border: none; width: 18px; }
 QPushButton {
-    border: 1px solid #e5e7eb; border-radius: 7px;
-    padding: 7px 18px; font-size: 12px; color: #374151; background: #fff;
+    border: 1px solid LINE_SOFT; border-radius: 8px;
+    padding: 8px 18px; font-size: 12.5px; color: INK_SOFT; background: #fff;
 }
-QPushButton:hover { background: #f9fafb; }
-QPushButton:disabled { color: #c0c4cc; background: #fafafa; }
-QPushButton#primary { background: #3b82f6; color: #fff; border: none; font-weight: bold; }
-QPushButton#primary:hover { background: #2563eb; }
-QPushButton#small { padding: 4px 12px; font-size: 11px; }
-QFrame#sep { background: #e5e7eb; max-height: 1px; border: none; }
+QPushButton:hover { background: BG_SOFT; border-color: GHOST; }
+QPushButton:disabled { color: GHOST; background: #ffffff; border-color: LINE; }
+QPushButton#primary {
+    background: ACCENT; color: #fff; border: 1px solid ACCENT; font-weight: 600;
+}
+QPushButton#primary:hover { background: ACCENT_HOVER; border-color: ACCENT_HOVER; }
+QPushButton#small { padding: 5px 13px; font-size: 11.5px; }
+QFrame#sep { background: LINE; max-height: 1px; border: none; }
 """
+
+
+def build_qss() -> str:
+    return theme.styled(QSS_TEMPLATE)
 
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setStyleSheet(QSS)
+        self.setStyleSheet(build_qss())
         self.setMinimumWidth(460)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
 
@@ -127,6 +139,46 @@ class SettingsDialog(QDialog):
         sep = QFrame()
         sep.setObjectName("sep")
         root.addWidget(sep)
+
+        # ───────────────── 显示 ─────────────────
+        disp_title = QLabel("显示")
+        disp_title.setObjectName("title")
+        root.addWidget(disp_title)
+
+        disp_form = QFormLayout()
+        disp_form.setSpacing(10)
+
+        # 打开时的档位 —— 点「取消」要能还原回去
+        self._font_saved = int(cfg.get("font_scale", theme.FONT_DEFAULT))
+
+        self.cb_font = QComboBox()
+        for pct, label in theme.FONT_PRESETS:
+            self.cb_font.addItem(f"{label}　（{pct}%）", pct)
+        idx = self.cb_font.findData(self._font_saved)
+        # 存的值不在预设里（比如手改过数据库）就选最接近的一档
+        if idx < 0:
+            idx = min(
+                range(self.cb_font.count()),
+                key=lambda i: abs(self.cb_font.itemData(i) - self._font_saved),
+            )
+        self.cb_font.setCurrentIndex(idx)
+        # ★ 信号必须**在 setCurrentIndex 之后**接。
+        #   反过来的话，初始化这一下就会触发 _on_font_preview，
+        #   把全局字号改回「数据库里存的值」—— 于是别处刚设的档位被悄悄重置。
+        #   （截图验证时踩到的：想渲染 130% 档，一开设置窗口就被打回 100%。）
+        self.cb_font.currentIndexChanged.connect(self._on_font_preview)
+        disp_form.addRow("界面字号", self.cb_font)
+
+        root.addLayout(disp_form)
+
+        self.lb_font = QLabel("换一档就能看到这个窗口立刻变化；点「保存」后整个界面都跟着变。")
+        self.lb_font.setObjectName("hint")
+        self.lb_font.setWordWrap(True)
+        root.addWidget(self.lb_font)
+
+        sep2 = QFrame()
+        sep2.setObjectName("sep")
+        root.addWidget(sep2)
 
         # ───────────────── AI 整理 ─────────────────
         ai_title = QLabel("AI 整理")
@@ -215,6 +267,24 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._on_save)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    # ────────────────────────── 字号 ──────────────────────────
+
+    def _on_font_preview(self) -> None:
+        """
+        换档时**立刻**在这里预览。
+
+        顺带会让悬浮窗也跟着变 —— 它每秒重绘一次，每次都从 theme 取字号，
+        所以不用专门通知它。点「取消」会在 reject() 里改回来，最多晚一秒。
+        """
+        theme.set_scale(self.cb_font.currentData())
+        self.setStyleSheet(build_qss())
+        self.adjustSize()
+
+    def reject(self) -> None:  # noqa: D102
+        # 取消 = 把预览的字号撤回去，别让界面停在没保存的档位上
+        theme.set_scale(self._font_saved)
+        super().reject()
 
     # ────────────────────────── 专注节奏 ──────────────────────────
 
@@ -345,7 +415,7 @@ class SettingsDialog(QDialog):
             )
             return
 
-        # 2) 专注节奏 → 数据库
+        # 2) 专注节奏 + 字号 → 数据库
         try:
             with SessionLocal() as db:
                 settings_svc.set_many(
@@ -353,6 +423,7 @@ class SettingsDialog(QDialog):
                     focus_minutes=self.sp_focus.value(),
                     break_minutes=self.sp_break.value(),
                     sound_enabled=1 if self.cb_sound.isChecked() else 0,
+                    font_scale=self.cb_font.currentData(),
                 )
         except ValueError as e:
             QMessageBox.warning(self, "没能保存", str(e))

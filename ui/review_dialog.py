@@ -23,31 +23,35 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-DIALOG_QSS = """
+from ui import theme
+
+DIALOG_QSS_TEMPLATE = """
 QDialog { background: #ffffff; }
-QLabel#title { color: #1f2937; font-size: 15px; font-weight: bold; }
+QLabel#title { color: INK; font-size: 15px; font-weight: 600; }
 QLabel#live  {
-    color: #1d4ed8; font-size: 12px; font-weight: bold;
-    background: #eff6ff; border-radius: 10px; padding: 4px 11px;
+    color: ACCENT; font-size: 12px; font-weight: 600;
+    background: ACCENT_SOFT; border-radius: 11px; padding: 5px 12px;
 }
-QLabel#meta  { color: #6b7280; font-size: 12px; }
-QLabel#note  { color: #9ca3af; font-size: 11px; }
+QLabel#meta  { color: MUTED; font-size: 12.5px; }
+QLabel#note  { color: FAINT; font-size: 11.5px; }
 QTextEdit {
-    border: 1px solid #e5e7eb; border-radius: 8px;
-    padding: 8px; font-size: 13px; color: #1f2937;
-    background: #fafafa;
+    border: 1px solid LINE_SOFT; border-radius: 10px;
+    padding: 10px; font-size: 13.5px; color: INK;
+    background: #ffffff;
 }
-QTextEdit:focus { border-color: #3b82f6; background: #ffffff; }
+QTextEdit:focus { border-color: ACCENT; }
 QPushButton {
-    border: 1px solid #e5e7eb; border-radius: 7px;
-    padding: 7px 18px; font-size: 12px; color: #374151; background: #ffffff;
+    border: 1px solid LINE_SOFT; border-radius: 8px;
+    padding: 8px 18px; font-size: 12.5px; color: INK_SOFT; background: #ffffff;
 }
-QPushButton:hover { background: #f9fafb; }
+QPushButton:hover { background: BG_SOFT; border-color: GHOST; }
 QPushButton#primary {
-    background: #3b82f6; color: #ffffff; border: none; font-weight: bold;
+    background: ACCENT; color: #ffffff; border: 1px solid ACCENT; font-weight: 600;
 }
-QPushButton#primary:hover { background: #2563eb; }
-QPushButton#primary:disabled { background: #cbd5e1; color: #f1f5f9; }
+QPushButton#primary:hover { background: ACCENT_HOVER; border-color: ACCENT_HOVER; }
+QPushButton#primary:disabled {
+    background: #ffffff; color: GHOST; border-color: LINE;
+}
 """
 
 
@@ -63,7 +67,7 @@ class ReviewDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("写总结")
-        self.setStyleSheet(DIALOG_QSS)
+        self.setStyleSheet(theme.styled(DIALOG_QSS_TEMPLATE))
         self.setMinimumWidth(420)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
         self._submitted = False

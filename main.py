@@ -24,11 +24,13 @@ os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from PyQt5.QtCore import Qt, QThread, QTimer
+from PyQt5.QtGui import QBrush, QColor
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QTreeWidget,
@@ -43,6 +45,7 @@ from services import llm as llm_svc
 from services import settings as settings_svc
 from services import sound as sound_svc
 from services import timer as timer_svc
+from ui import theme
 from ui.dashboard import Dashboard, fmt_hours
 from ui.floating import FloatingTimer
 from ui.review_dialog import ReviewDialog
@@ -82,30 +85,45 @@ class CategoryPicker(QDialog):
         super().__init__(parent)
         self.setWindowTitle("学哪个方向？")
         self.setMinimumWidth(340)
-        self.resize(380, 440)
+        self.resize(380, 460)
         self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-        self.setStyleSheet("""
-            QDialog { background:#fff; }
-            QLabel { color:#6b7280; font-size:12px; }
-            QTreeWidget { border:1px solid #e5e7eb; border-radius:8px; font-size:13px;
-                          color:#1f2937; outline:none; padding:4px; background:#fff; }
-            QTreeWidget::item { padding:9px 4px; border-radius:6px; min-height:18px; }
-            QTreeWidget::item:selected { background:#eff6ff; color:#1d4ed8; }
-            QTreeWidget::branch { background:transparent; }
-        """)
+        self.setStyleSheet(theme.styled("""
+            QDialog { background: #ffffff; }
+            QLabel { color: MUTED; font-size: 12.5px; }
+            QTreeWidget {
+                border: 1px solid LINE; border-radius: 10px; font-size: 13px;
+                color: INK_SOFT; outline: none; padding: 4px; background: #ffffff;
+            }
+            QTreeWidget::item { padding: 9px 6px; border-radius: 7px; min-height: 16px; }
+            QTreeWidget::item:selected { background: ACCENT_SOFT; color: ACCENT; }
+            QTreeWidget::item:hover { background: BG_SOFT; }
+            QTreeWidget::branch { background: transparent; }
+            QPushButton {
+                border: 1px solid LINE_SOFT; border-radius: 8px;
+                padding: 8px 18px; font-size: 12.5px; color: INK_SOFT;
+                background: #ffffff;
+            }
+            QPushButton:hover { background: BG_SOFT; border-color: GHOST; }
+        """))
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
 
         layout.addWidget(QLabel("选一个类别，开始计时"))
 
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setColumnCount(1)
-        self.tree.setIndentation(16)
+        self.tree.setColumnCount(2)
+        self.tree.setIndentation(theme.px(15))
         self.tree.setExpandsOnDoubleClick(False)
-        self.tree.setMinimumHeight(260)
+        self.tree.setMinimumHeight(280)
+        self.tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        hdr = self.tree.header()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.setColumnWidth(1, theme.px(62))
 
         with SessionLocal() as db:
             self._tree = timer_svc.category_tree(db)
@@ -117,22 +135,26 @@ class CategoryPicker(QDialog):
 
             if kids:
                 # 分组：不可选
-                group = QTreeWidgetItem([f"{cat.name}    ·    {fmt_hours(total)}"])
+                group = QTreeWidgetItem([cat.name, fmt_hours(total)])
                 group.setFlags(Qt.ItemIsEnabled)          # 没有 ItemIsSelectable
                 group.setToolTip(0, "这是分组，不能直接计时 —— 请选它下面的子类别")
+                group.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                group.setForeground(1, QBrush(QColor(theme.FAINT)))
                 self.tree.addTopLevelItem(group)
                 for ch in kids:
-                    sub = QTreeWidgetItem(
-                        [f"{ch['cat'].name}    ·    {fmt_hours(ch['total'])}"]
-                    )
+                    sub = QTreeWidgetItem([ch["cat"].name, fmt_hours(ch["total"])])
                     sub.setData(0, Qt.UserRole, ch["cat"].id)
+                    sub.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                    sub.setForeground(1, QBrush(QColor(theme.FAINT)))
                     group.addChild(sub)
                     if first_leaf is None:
                         first_leaf = sub
                 group.setExpanded(True)
             else:
-                leaf = QTreeWidgetItem([f"{cat.name}    ·    {fmt_hours(total)}"])
+                leaf = QTreeWidgetItem([cat.name, fmt_hours(total)])
                 leaf.setData(0, Qt.UserRole, cat.id)
+                leaf.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                leaf.setForeground(1, QBrush(QColor(theme.FAINT)))
                 self.tree.addTopLevelItem(leaf)
                 if first_leaf is None:
                     first_leaf = leaf
@@ -168,6 +190,12 @@ class CategoryPicker(QDialog):
 
 class FocusApp:
     def __init__(self) -> None:
+        # ★ 偏好设置必须在**建窗口之前**读：界面字号是在构造时算进 QSS 的，
+        #   晚一步设置的话，看板会一直用默认字号，直到下次改设置才跟上。
+        with SessionLocal() as db:
+            self.cfg = settings_svc.get_all(db)
+        theme.set_scale(self.cfg["font_scale"])
+
         self.win = FloatingTimer()
         self.dashboard = Dashboard()
         self.active = None                  # 当前在跑的 FocusSession（内存副本）
@@ -181,10 +209,6 @@ class FocusApp:
         self.win.settings_requested.connect(self.on_settings)
         self.win.dashboard_requested.connect(self.toggle_dashboard)
         self.win.skip_break_requested.connect(self.on_skip_break)
-
-        # 偏好设置（缓存，避免每秒查库）
-        with SessionLocal() as db:
-            self.cfg = settings_svc.get_all(db)
 
         # 上一次看到的阶段。None = 还没接上，第一次只记录不响铃。
         self._last_phase: str | None = None
@@ -317,11 +341,27 @@ class FocusApp:
         sound_svc.play("focus_end" if phase == "break" else "break_end")
 
     def on_settings(self) -> None:
-        """右键 → 设置。改完立刻生效。"""
+        """
+        右键 → 设置。改完立刻生效。
+
+        字号在对话框里是**实时预览**的（点一下就能看到），所以不管确定还是取消，
+        关掉对话框之后都要把主题同步成「当前真正生效的值」，
+        并让常驻的看板/悬浮窗重画一次。
+        """
+        before = theme.scale_percent()
         dlg = SettingsDialog(self.win)
-        if dlg.exec_() == QDialog.Accepted:
+        accepted = dlg.exec_() == QDialog.Accepted
+
+        if accepted:
             with SessionLocal() as db:
                 self.cfg = settings_svc.get_all(db)
+
+        theme.set_scale(self.cfg["font_scale"])
+        if theme.scale_percent() != before:
+            self.dashboard.reapply_theme()
+            self.win.update()
+
+        if accepted:
             # 改设置 = 重新划分整条时间线，阶段可能**原地跳变**。
             # 这不算真的切换，静默重算（_last_phase=None 让下一帧只记录不响铃）。
             self._last_phase = None

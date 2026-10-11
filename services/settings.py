@@ -1,5 +1,5 @@
 """
-偏好设置 —— 专注时长、休息时长。
+偏好设置 —— 专注时长、休息时长、提示音、界面字号。
 
 存 `setting` 表（键值对）。读的时候带上默认值，所以第一次跑不用手动初始化。
 """
@@ -15,6 +15,7 @@ DEFAULTS: dict[str, str] = {
     "focus_minutes": "25",   # 一次专注多少分钟
     "break_minutes": "5",    # 一次休息多少分钟
     "sound_enabled": "1",    # 阶段切换时要不要响（1 开 / 0 关）
+    "font_scale": "100",     # 界面字号档，百分比（见 ui/theme.FONT_PRESETS）
 }
 
 # 取值范围（防手滑填 0 或 999）
@@ -22,6 +23,7 @@ LIMITS: dict[str, tuple[int, int]] = {
     "focus_minutes": (1, 180),
     "break_minutes": (1, 60),
     "sound_enabled": (0, 1),
+    "font_scale": (70, 160),
 }
 
 # 越界报错时跟在数字后面的单位，让提示是人话
@@ -29,6 +31,7 @@ LIMIT_UNITS: dict[str, str] = {
     "focus_minutes": " 分钟",
     "break_minutes": " 分钟",
     "sound_enabled": "（0 = 关，1 = 开）",
+    "font_scale": "%（70 ~ 160）",
 }
 
 
