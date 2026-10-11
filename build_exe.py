@@ -2,24 +2,28 @@
 打包成 exe。
 
 用法：
-    python build_exe.py                # 开发自用：单文件版，放 dist/
-                                       # （会自动抄一份本机 .env 过去，方便拿真实数据试）
-    python build_exe.py --dir          # 开发自用：文件夹版
-    python build_exe.py --release      # ★ 发布给别人：文件夹版 + 使用说明 + .env.example
-                                       #   最后压成 release/FocusTimer-vX.Y.Z-win64.zip
-    python build_exe.py --release --onefile   # 发布版但打单文件
+    python build_exe.py                # 自用版 → app/FocusTimer.exe（★ 日常双击这个）
+    python build_exe.py --onefile      # 自用版，但打成单个 exe（启动慢几秒）
+    python build_exe.py --release      # 发布版 → release/FocusTimer-vX.Y.Z-win64.zip
 
-发布版和开发版的区别（重要）：
-    · **不抄 .env** —— 你的数据库密码不会跟着发布包走。
-      发布版默认用 SQLite（程序目录下的 focus_timer.db），对方不用装 MySQL。
-    · 多一个「使用说明.txt」和「.env.example」。
-    · 打成一个 zip，可以直接挂 GitHub Release。
+三个目录各管一件事，别混：
+
+    app/        自用版。你的日常入口，不会被构建清掉。
+                旁边的 .env 指向**项目根**的 focus_timer.db，所以重新打包不丢数据。
+    release/    发布版。发给别人的，不带任何数据，对方从零开始记。
+    dist/       PyInstaller 的中转目录。打完包**自动删掉**，
+                就是为了不让里面留个 exe 让人误点（数据会跟着一起被清）。
+
+发布版和自用版的区别（重要）：
+    · 发布版**不写 .env** —— 你的数据库密码不会跟着发布包走
+    · 发布版默认用 SQLite（对方不用装 MySQL），多一份「使用说明.txt」和
+      「.env.example」，并压成 zip
+    · 自用版会写 .env 指到项目根的数据库，方便拿真实数据试 —— **别外发**
 
 产物：
-    dist/FocusTimer.exe                    ← 单文件版（放到桌面双击就能开）
-    dist/FocusTimer/FocusTimer.exe         ← 文件夹版（启动快，整个文件夹要一起拷）
-    release/FocusTimer-vX.Y.Z-win64/       ← 发布版文件夹
-    release/FocusTimer-vX.Y.Z-win64.zip    ← 发布版压缩包
+    app/FocusTimer.exe                     ← 你用的
+    release/FocusTimer-vX.Y.Z-win64/       ← 给别人的（文件夹）
+    release/FocusTimer-vX.Y.Z-win64.zip    ← 给别人的（压缩包）
 
 首次打包慢（几分钟），之后会快一些。
 """
@@ -32,9 +36,10 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DIST = ROOT / "dist"
-BUILD = ROOT / "build"
-RELEASE = ROOT / "release"
+DIST = ROOT / "dist"          # PyInstaller 的输出目录 —— 纯中转，打完就清掉
+BUILD = ROOT / "build"        # PyInstaller 的中间文件 —— 打完就清掉
+RELEASE = ROOT / "release"    # 发布包（发给别人的）
+APP = ROOT / "app"            # ★ 开发自用版的落地位置 —— 你的日常入口
 
 # 这些模块是运行时才用到的，PyInstaller 静态分析扫不到，得手动告诉它
 HIDDEN_IMPORTS = [
@@ -247,19 +252,32 @@ def _write_dev_env(built: Path) -> str:
     return note
 
 
-def _running_exe() -> str:
+def _find_exe(folder: Path) -> Path | None:
+    """在一个文件夹里找 FocusTimer.exe（文件夹版在子目录里、单文件版在根上）。"""
+    for p in (folder / "FocusTimer" / "FocusTimer.exe", folder / "FocusTimer.exe"):
+        if p.exists():
+            return p
+    return None
+
+
+def _running_exe(folders: tuple[Path, ...]) -> str:
     """
-    打包前检查：dist 里那个 exe 是不是还在跑。
+    打包前检查：**这次会被删掉的那些目录**里，exe 是不是还在跑。
 
     ★ 为什么必须拦：Windows 上正在运行的 exe 删不掉，rmtree(ignore_errors=True)
-      会**静默跳过**它，于是 dist/ 只删了一半；PyInstaller 再往里写就会产出一个
+      会**静默跳过**它，于是目录只删了一半；PyInstaller 再往里写就会产出一个
       新旧文件混在一起的坏包 —— 而且你根本看不出来。
       宁可让打包直接失败，也不要给一个跑不起来的 exe。
 
+    ★ 只查会动到的目录：自用版会重建 app/，就得查 app/；
+      发布版只用 dist/ 中转、完全不碰 app/ —— 那就没必要逼用户
+      把自己正在用的程序关掉。
+
     判断方法：能不能独占打开这个文件。开着就说明有进程占着。
     """
-    for exe in (DIST / "FocusTimer" / "FocusTimer.exe", DIST / "FocusTimer.exe"):
-        if not exe.exists():
+    for folder in folders:
+        exe = _find_exe(folder)
+        if exe is None:
             continue
         try:
             with open(exe, "rb+"):
@@ -269,18 +287,21 @@ def _running_exe() -> str:
     return ""
 
 
-def _rescue_dist_data() -> tuple[str, int]:
+def _rescue_data(folder: Path) -> tuple[str, int]:
     """
-    清空 dist/ 之前，先看看里面有没有还没搬走的学习记录，有就另存一份。
+    删掉一个文件夹之前，先看看里面有没有还没搬走的学习记录，有就另存一份。
 
     ★ 为什么必须做这件事：
-      exe 把 SQLite 数据存在**自己旁边**，而 dist/ 是构建产物、每次打包都被整个删掉。
-      要是从 dist/ 里直接双击过那个 exe 并记了东西，记录会在下次打包时
-      悄无声息地消失 —— 实测就这么丢过。
+      exe 把 SQLite 数据存在**自己旁边**。要是目录里那个 exe 没有 .env
+      （比如手动删掉了、或者是从 dist/ 里直接双击的旧包），它就会就地建库；
+      而这个目录在下次打包时会被整个删掉 —— 记录悄无声息地消失，实测踩过。
 
     返回 (另存到哪, 有多少条记录)。没有数据就是 ("", 0)。
     """
-    candidates = [DIST / "focus_timer.db", DIST / "FocusTimer" / "focus_timer.db"]
+    candidates = [
+        folder / "focus_timer.db",
+        folder / "FocusTimer" / "focus_timer.db",
+    ]
     db = next((p for p in candidates if p.exists()), None)
     if db is None:
         return ("", 0)
@@ -302,6 +323,47 @@ def _rescue_dist_data() -> tuple[str, int]:
     return (str(dst), n)
 
 
+def _warn_rescued(rescued: str, n: int, where: str) -> None:
+    print("!" * 62)
+    print(f"⚠  {where} 里有 {n} 条学习记录还没搬走，已经先另存一份：")
+    print(f"     {rescued}")
+    print()
+    print("   原因：exe 把数据存在自己旁边，而这个目录打包时会被清空。")
+    print("   正常用 app/ 里那个 exe 就不会有这问题 —— 它的 .env 指向")
+    print(f"   项目根的 focus_timer.db。")
+    print("!" * 62)
+
+
+def _install_dev_app(built: Path) -> Path:
+    """
+    把开发版产物装到 `app/` —— 你的日常入口。
+
+    ★ 为什么不留在 dist/：
+      dist/ 是 PyInstaller 的输出目录，名字听着就像临时垃圾，而且每次打包都要清空。
+      放在那里迟早有人（包括我自己）从里面双击 exe 记数据，然后被下次打包清掉。
+      app/ 不参与构建清零，是稳定的「我的程序」位置。
+
+    做法是先把产物搬到 app/，再写 .env 和音效，最后把 dist/ 整个删掉。
+    这样 **dist/ 里永远不会留着 exe** —— 想点错都没得点。
+    """
+    if APP.exists():
+        rescued, n = _rescue_data(APP)
+        shutil.rmtree(APP, ignore_errors=True)
+        if rescued:
+            _warn_rescued(rescued, n, "app/")
+    APP.mkdir(parents=True)
+
+    if built.is_dir():
+        # 文件夹版：把 exe 和 _internal 一起搬过来（同盘内是改名，很快）
+        for item in built.iterdir():
+            shutil.move(str(item), str(APP / item.name))
+    else:
+        shutil.move(str(built), str(APP / built.name))
+
+    print("  " + _write_dev_env(APP))
+    print("  " + _copy_assets(APP))
+    return APP
+
 def main() -> int:
     release = "--release" in sys.argv
     if release:
@@ -309,34 +371,29 @@ def main() -> int:
         # 别人第一次打开会觉得「怎么半天没反应」。
         onefile = "--onefile" in sys.argv
     else:
-        onefile = "--dir" not in sys.argv
+        # ★ 自用版默认也走文件夹式：启动快，而且每次打包都要重造，
+        #   没必要为「只有一个文件」牺牲每次启动的十几秒。
+        onefile = "--onefile" in sys.argv
 
-    # —— 先看看上一个包是不是还开着 ——
-    busy = _running_exe()
+    # —— 先看看会被动到的目录里，exe 是不是还开着 ——
+    busy = _running_exe((DIST, APP) if not release else (DIST,))
     if busy:
         print("!" * 62)
-        print("✗ 打包中止：dist 里那个 exe 还在运行")
+        print("✗ 打包中止：这个 exe 还在运行")
         print(f"     {busy}")
         print()
-        print("   正在运行的 exe 删不掉，dist/ 会只删一半，打出来的包是坏的。")
-        print("   请先把它关掉（右下角托盘里找找，或者任务管理器结束 FocusTimer.exe）")
-        print("   然后再跑一次打包。你的数据在项目根的 focus_timer.db 里，不受影响。")
+        print("   正在运行的 exe 删不掉，目录会只删一半，打出来的包是坏的。")
+        print("   请先把它关掉（任务管理器里结束 FocusTimer.exe）再跑一次打包。")
+        print("   你的数据在项目根的 focus_timer.db 里，不受影响。")
         print("!" * 62)
         return 1
 
     # —— 清空 dist/（顺带把里面的数据救出来）——
     if DIST.exists():
-        rescued, n = _rescue_dist_data()
+        rescued, n = _rescue_data(DIST)
         shutil.rmtree(DIST, ignore_errors=True)
         if rescued:
-            print("!" * 62)
-            print(f"⚠  dist/ 里有 {n} 条学习记录还没搬走，已经先另存一份：")
-            print(f"     {rescued}")
-            print()
-            print("   原因：exe 把数据存在自己旁边，而 dist/ 每次打包都会整个清空。")
-            print("   以后想留着数据用 exe，请用不带 --release 打的包 ——")
-            print("   它的 .env 指向项目根目录的 focus_timer.db，重建不会丢。")
-            print("!" * 62)
+            _warn_rescued(rescued, n, "dist/")
     if BUILD.exists():
         shutil.rmtree(BUILD, ignore_errors=True)
 
@@ -359,27 +416,25 @@ def main() -> int:
         print("  对方解压后双击 exe 即可，默认用 SQLite，不需要装 MySQL。")
         print("  要把压缩包上传到 GitHub Release 的话，记得先确认里面没有")
         print("  ai_config.json（那个文件里有你的 API Key）。")
-
-        # ★ dist/ 到这里只是个中转站，内容已经复制进 release/ 了。
-        #   留着它反而是个坑：里面那个 exe 旁边**没有 .env**，一跑就把数据
-        #   写进 dist/，下次打包连库一起被清掉 —— 实测就是这么丢的数据。
-        if DIST.exists():
-            shutil.rmtree(DIST, ignore_errors=True)
-            print("\n已清理中转目录 dist/（内容已经在 release/ 里了）")
     else:
-        print("打包完成")
+        out = _install_dev_app(built)
+        print("打包完成（自用版）")
         print("=" * 56)
-        print(f"产物: {built}")
-        print("  " + _write_dev_env(built))
-        print("  " + _copy_assets(built))
-        print("\n用法：双击 exe。整个文件夹一起拷走才有效。")
-        print("      数据存在项目根目录的 focus_timer.db，重新打包不会丢。")
+        print(f"\n你的程序: {out}")
+        print(f"双击这个: {out / 'FocusTimer.exe'}")
+        print("\n  数据存在项目根的 focus_timer.db，重新打包不会丢。")
+        print("  别把它拷给别人 —— 旁边的 .env 里有本机信息。")
+        print("  要发布请用：python build_exe.py --release")
 
-    # 清掉中间产物 —— build/ 里也有个同名 exe，但它缺依赖，永远打不开，
-    # 留着只会让人点错。
+    # —— 清掉中转目录 ——
+    # dist/ 里的东西已经搬走了（自用版搬去 app/，发布版复制去 release/）。
+    # ★ 一定要删干净：留着它就可能有人在里面双击 exe 记数据，然后被下次打包清掉。
+    if DIST.exists():
+        shutil.rmtree(DIST, ignore_errors=True)
+        print("\n已清理中转目录 dist/")
+    # build/ 里也有个同名 exe，但它缺依赖，永远打不开，留着只会让人点错。
     if BUILD.exists():
         shutil.rmtree(BUILD, ignore_errors=True)
-        print("\n已清理中间产物 build/")
 
     return 0
 

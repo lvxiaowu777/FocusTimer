@@ -13,6 +13,7 @@ __pycache__/
 venv/
 
 # —— 打包产物 ——
+app/
 build/
 dist/
 release/

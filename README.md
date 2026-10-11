@@ -29,55 +29,78 @@ python main.py                       # 启动
 
 > `ai_config.json` 里是**明文 Key**，别把它发给别人 —— 它已经被 `.gitignore` 挡住了。
 
-### 打包给别人用
+### 打包
 
 ```bash
-python build_exe.py --release
+python build_exe.py                # 自用版 → app/FocusTimer.exe（★ 日常双击这个）
+python build_exe.py --onefile      # 自用版，打成单个 exe（启动慢几秒）
+python build_exe.py --release      # 发布版 → release/FocusTimer-vX.Y.Z-win64.zip
 ```
 
-产出 `release/FocusTimer-vX.Y.Z-win64.zip`（名字带当前版本号），可以直接挂到 GitHub Release。发布包里：
-
-- **不含 `.env`** —— 你的数据库密码不会跟着出去，对方解压双击就能用（走 SQLite）
-- 含 `使用说明.txt` 和 `.env.example`（示例配置，只有注释和占位符）
-- 含 `assets/` 音效
-
-不加 `--release` 则是**开发自用**的打包。它会给 exe 生成一个 `.env`，
-写明**源码当前解析出来的连接串**，让 exe 和 `python main.py` 用同一份数据 ——
-这样你双击 exe 就能看到自己的记录。
+**自用版**装到 `app/`，并给它写一个 `.env`，写明**源码当前解析出来的连接串** ——
+让 exe 和 `python main.py` 用同一份数据。这就是重新打包不丢记录的原因。
 
 > ⚠️ 这里有个坑：早先的实现是直接**抄一份项目 .env** 过去。但用 SQLite 时
 > 项目 `.env` 里 `FOCUS_DATABASE_URL` 是空的（默认值就是 SQLite），抄过去
 > exe 只会在自己旁边新建一个**空库**，看起来就是「打开什么都没有」。
 > 现在改成写解析后的连接串，SQLite 一定是绝对路径，两边指向同一个文件。
 
-开发版的产物含本机信息，**别外发**；要发布请用 `--release`。
+**发布版**产出 `release/FocusTimer-vX.Y.Z-win64.zip`，可以直接挂到 GitHub Release：
 
-### ⚠️ 数据存在哪 —— 为什么 `dist/` 里的数据会没
+- **不含 `.env`** —— 你的数据库密码不会跟着出去，对方解压双击就能用（走 SQLite）
+- 含 `使用说明.txt` 和 `.env.example`（示例配置，只有注释和占位符）
+- 含 `assets/` 音效
 
-**`dist/` 是构建产物，每次打包都会被整个删掉。** 而 exe 默认把 SQLite 数据
-存在**自己旁边**（`focus_timer.db`）。两件事碰在一起就是：
+自用版的产物含本机信息，**别外发**；要发布请用 `--release`。
 
-> 从 `dist/` 里双击 exe 记了东西 → 下次 `python build_exe.py` 一跑，
-> `dist/` 被清空，记录**悄无声息地没了**。
+### 三个目录各管一件事，别混
 
-三种入口各自的数据库位置：
+```
+FocusTimer/
+├── focus_timer.db   ★ 你的数据 —— 一个文件装全部记录，备份就是拷走它
+├── app/             ★ 自用版程序 —— 日常双击 app/FocusTimer.exe
+├── release/           发布包（zip，发给别人的，不带任何数据）
+├── dist/  build/      打包中转目录 —— 打完包会自动删掉，正常不存在
+└── db/ services/ ui/ assets/ ...   源码
+```
 
-| 怎么跑 | 数据文件在哪 | 重建/换机会丢吗 |
+| 目录 | 是什么 | 会被构建清掉吗 |
+|---|---|---|
+| `app/` | **你日常用的 exe** | 会重建，但**数据不在里面**，所以无所谓 |
+| `release/` | 发给别人的发布包 | 不会 |
+| `dist/` `build/` | PyInstaller 的临时产物 | 打完包就删，**里面不该有 exe** |
+
+`app/` 里那个 exe 旁边有个 `.env`，指向**项目根**的 `focus_timer.db`。
+这就是为什么换代码、重新打包，你的记录都还在：
+
+```
+打包前: 记录 17  指纹 dcae7abb...
+        ↓ 完整重新打包（exe 被换成新的）
+打包后: 记录 17  指纹 dcae7abb...   ← 一模一样
+```
+
+**换个比方**：`app/` 是手机，`focus_timer.db` 是 SIM 卡。换手机不影响卡里的东西。
+（旧版本是"数据存在程序文件夹里"，等于把卡焊死在手机上 —— 换一次丢一次。）
+
+### 三种入口各自的数据位置
+
+| 怎么跑 | 数据文件在哪 | 重建会丢吗 |
 |---|---|---|
 | `python main.py` | 项目根 `focus_timer.db` | 不会 |
-| `python build_exe.py`（开发自用） | **项目根** `focus_timer.db` | 不会（会自动写 `.env` 指过去） |
-| `python build_exe.py --release` 解压给别人 | 各自解压目录里的 `focus_timer.db` | 跟着那个文件夹走，是设计如此 |
-| ~~从 `dist/` 里直接双击~~ | `dist/…/focus_timer.db` | **会丢** —— 别这么用 |
+| `app/FocusTimer.exe`（自用版） | **项目根** `focus_timer.db` | 不会 |
+| `release/…` 解压给别人 | 各自解压目录里的 | 跟着那个文件夹走，设计如此 |
 
-**所以自用就老老实实跑 `python build_exe.py`**，它的 `.env` 会把 exe 指到
-项目根那份数据上，随便重建都不会丢。
+一句话：**认准 `app\FocusTimer.exe`**。判断方法看它旁边有没有 `.env` ——
+有 `.env` 的才是自用版。
 
-两道保险已经加上：
+### 三道保险
 
-1. 打 `--release` 之后会**删掉中转目录 `dist/`** —— 里面那个 exe 旁边没有 `.env`，
-   留着就是个坑。（旧版本一直留着，数据就是这么丢的。）
-2. 清空 `dist/` **之前**会先检查里面有没有学习记录，有就另存成
-   `focus_timer_rescued_<时间>.db` 放在项目根，并打印醒目提示。
+1. **打完包自动删掉中转目录 `dist/`** —— 里面那个 exe 旁边没有 `.env`，
+   一跑就把数据写进 `dist/`，下次打包连库一起清。删掉它，想点错都没得点。
+2. **打包前检查 exe 是否还在运行** —— 正在运行的 exe 删不掉，`dist/` 会只删一半、
+   打出坏包。检测到就直接中止并提示去关掉。
+3. **删目录前先抢救数据** —— 万一里面真有记录，另存成
+   `focus_timer_rescued_<时间>.db` 放在项目根（空库不备份）。
 
 **自用和发布的区别一句话**：自用的包连项目根那份数据；发布包不带任何数据，
 对方从零开始记。
@@ -183,8 +206,9 @@ services/        timer.py（计时业务 + 类别树）· settings.py · sound.p
 ui/              floating.py（悬浮窗）· review_dialog.py · dashboard.py（类别树 + 段落卡片）
                  settings_dialog.py（专注节奏 + AI 配置）
 assets/          focus_end.wav · break_end.wav（可替换）
-build_exe.py     打包（--release 出发布包）
+build_exe.py     打包（自用版 → app/；--release → release/）
 migrate_db.py    换数据库 / 搬记录
+app/             自用版程序（自动生成，已被 gitignore）
 focus_timer.db   SQLite 数据文件（自动生成，已被 gitignore）
 ai_config.json   界面上填的 AI 配置（自动生成，已被 gitignore）
 ```
