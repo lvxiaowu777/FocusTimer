@@ -247,6 +247,28 @@ def _write_dev_env(built: Path) -> str:
     return note
 
 
+def _running_exe() -> str:
+    """
+    打包前检查：dist 里那个 exe 是不是还在跑。
+
+    ★ 为什么必须拦：Windows 上正在运行的 exe 删不掉，rmtree(ignore_errors=True)
+      会**静默跳过**它，于是 dist/ 只删了一半；PyInstaller 再往里写就会产出一个
+      新旧文件混在一起的坏包 —— 而且你根本看不出来。
+      宁可让打包直接失败，也不要给一个跑不起来的 exe。
+
+    判断方法：能不能独占打开这个文件。开着就说明有进程占着。
+    """
+    for exe in (DIST / "FocusTimer" / "FocusTimer.exe", DIST / "FocusTimer.exe"):
+        if not exe.exists():
+            continue
+        try:
+            with open(exe, "rb+"):
+                pass
+        except OSError:
+            return str(exe)
+    return ""
+
+
 def _rescue_dist_data() -> tuple[str, int]:
     """
     清空 dist/ 之前，先看看里面有没有还没搬走的学习记录，有就另存一份。
@@ -288,6 +310,19 @@ def main() -> int:
         onefile = "--onefile" in sys.argv
     else:
         onefile = "--dir" not in sys.argv
+
+    # —— 先看看上一个包是不是还开着 ——
+    busy = _running_exe()
+    if busy:
+        print("!" * 62)
+        print("✗ 打包中止：dist 里那个 exe 还在运行")
+        print(f"     {busy}")
+        print()
+        print("   正在运行的 exe 删不掉，dist/ 会只删一半，打出来的包是坏的。")
+        print("   请先把它关掉（右下角托盘里找找，或者任务管理器结束 FocusTimer.exe）")
+        print("   然后再跑一次打包。你的数据在项目根的 focus_timer.db 里，不受影响。")
+        print("!" * 62)
+        return 1
 
     # —— 清空 dist/（顺带把里面的数据救出来）——
     if DIST.exists():
