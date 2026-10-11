@@ -35,14 +35,39 @@ python main.py                       # 启动
 python build_exe.py --release
 ```
 
-产出 `release/FocusTimer-v0.3.0-win64.zip`，可以直接挂到 GitHub Release。发布包里：
+产出 `release/FocusTimer-vX.Y.Z-win64.zip`（名字带当前版本号），可以直接挂到 GitHub Release。发布包里：
 
 - **不含 `.env`** —— 你的数据库密码不会跟着出去，对方解压双击就能用（走 SQLite）
 - 含 `使用说明.txt` 和 `.env.example`（示例配置，只有注释和占位符）
 - 含 `assets/` 音效
 
-加了 `--dir` / `--release` 之外不加参数运行，则是**开发自用**的打包：会顺手抄一份
-本机 `.env` 到 `dist/`，让 exe 连你真实的数据库，方便拿真实数据试 —— 那个产物不要外发。
+不加 `--release` 则是**开发自用**的打包。它会给 exe 生成一个 `.env`，
+写明**源码当前解析出来的连接串**，让 exe 和 `python main.py` 用同一份数据 ——
+这样你双击 exe 就能看到自己的记录。
+
+> ⚠️ 这里有个坑：早先的实现是直接**抄一份项目 .env** 过去。但用 SQLite 时
+> 项目 `.env` 里 `FOCUS_DATABASE_URL` 是空的（默认值就是 SQLite），抄过去
+> exe 只会在自己旁边新建一个**空库**，看起来就是「打开什么都没有」。
+> 现在改成写解析后的连接串，SQLite 一定是绝对路径，两边指向同一个文件。
+
+开发版的产物含本机信息，**别外发**；要发布请用 `--release`。
+
+### 换数据库 / 搬记录
+
+```bash
+python migrate_db.py --to sqlite --dry-run   # 先看会搬什么，不写任何东西
+python migrate_db.py --to sqlite             # 把当前库搬到程序目录下的 focus_timer.db
+python migrate_db.py --to "mysql+pymysql://root:密码@localhost:3306/focus_timer"
+```
+
+反向往 MySQL 搬也可以，同一个命令换个 `--to`。
+
+- **保持 id 不变** —— `session.category_id`、`item.session_id`、`category.parent_id`
+  都不用重映射，省掉一大类难查的 bug
+- `category.parent_id` 是自引用外键，先全部以 NULL 插入、第二遍再补父子关系
+  （否则子类别排在父类别前面时会违反外键）
+- 搬完**对比两边行数**，对不上就报错退出，不静默「成功」
+- 目标已有数据时默认拒绝，要清空重来必须显式加 `--force`
 
 ## 用法
 
@@ -114,6 +139,7 @@ ui/              floating.py（悬浮窗）· review_dialog.py · dashboard.py�
                  settings_dialog.py（专注节奏 + AI 配置）
 assets/          focus_end.wav · break_end.wav（可替换）
 build_exe.py     打包（--release 出发布包）
+migrate_db.py    换数据库 / 搬记录
 focus_timer.db   SQLite 数据文件（自动生成，已被 gitignore）
 ai_config.json   界面上填的 AI 配置（自动生成，已被 gitignore）
 ```

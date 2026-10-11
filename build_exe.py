@@ -212,6 +212,40 @@ def _assemble_release(built: Path) -> Path:
     return out
 
 
+def _write_dev_env(built: Path) -> str:
+    """
+    开发版：给 exe 写一个 .env，让它和源码连**同一个库**。
+
+    ★ 不能直接抄项目里那份 .env —— 用 SQLite 默认值的时候，那份里
+      FOCUS_DATABASE_URL 是空的（或整行被注释掉）。抄过去 exe 只会在
+      自己旁边新建一个**空库**，你就看不到自己的记录。
+      （这个是实测踩出来的：exe 打开里面啥都没有，就是因为这个。）
+
+    所以这里写的是**源码解析出来的那个连接串**。SQLite 一定是绝对路径 ——
+    否则 exe 会在自己所在目录找文件，跟源码那份又不是同一个了。
+    """
+    import config          # 延迟 import：它会读 .env，确定要用时才触发
+
+    url = config.DATABASE_URL
+    if url.startswith("sqlite"):
+        path = url.split("///")[-1]
+        note = f"已生成 .env → exe 与源码共用同一份数据:\n      {path}"
+    else:
+        note = (
+            f"已生成 .env → exe 连的是 MySQL（连接串含密码）\n"
+            f"      ⚠ dist/ 只许自己用，别外发。要发布请用："
+            f"python build_exe.py --release"
+        )
+
+    (built / ".env").write_text(
+        "# 由 build_exe.py 自动生成 —— 让 exe 和 `python main.py` 用同一份数据。\n"
+        "# 里面是本机信息，别外发。要发布请用：python build_exe.py --release\n"
+        f"FOCUS_DATABASE_URL={url}\n",
+        encoding="utf-8",
+    )
+    return note
+
+
 def main() -> int:
     release = "--release" in sys.argv
     if release:
@@ -249,15 +283,9 @@ def main() -> int:
         print("=" * 56)
         print(f"产物: {built}")
         # 开发版故意抄一份本机 .env：这样 exe 连的是你真实的数据库，
-        # 方便拿真实数据试。**这个产物不要外发。**
-        env_src = ROOT / ".env"
-        if env_src.exists():
-            shutil.copy2(env_src, built / ".env")
-            print(f"已抄本机 .env → {built / '.env'}")
-            print("  ⚠ 这个 .env 里有你的数据库密码，dist/ 只许自己用，别外发。")
-            print("     要发布请用：python build_exe.py --release")
-        else:
-            print("没找到 .env —— exe 会用 SQLite（程序目录下新建 focus_timer.db）")
+        # 开发版：让 exe 和源码用**同一份数据**。
+        # **这个产物不要外发**（.env 里有本机信息）。
+        print("  " + _write_dev_env(built))
         print("  " + _copy_assets(built))
         print("\n用法：双击 exe。整个文件夹一起拷走才有效。")
 

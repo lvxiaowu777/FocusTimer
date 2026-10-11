@@ -23,38 +23,52 @@ from sqlalchemy.orm import sessionmaker
 from config import DATABASE_URL, IS_SQLITE
 from db.models import Base, Category
 
-# —— 引擎参数按后端区分 ——
-_engine_kwargs: dict = {
-    "pool_pre_ping": True,      # 连接失效自动重连
-    "echo": False,
-}
-if IS_SQLITE:
-    # ★ check_same_thread=False 是必须的：AI 整理跑在后台线程里，而 SQLite
-    #   默认禁止一个连接被别的线程用。关掉这个检查后由 SQLAlchemy 的连接池
-    #   保证同一时刻只有一个线程在用某个连接，是安全的。
-    _engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15}
-else:
-    _engine_kwargs["pool_recycle"] = 3600
 
-engine = create_engine(DATABASE_URL, **_engine_kwargs)
+def make_engine(url: str):
+    """
+    按后端建一个引擎。
 
-if IS_SQLITE:
+    SQLite 要带上几个必须的 pragma，MySQL 要带连接回收 —— 两边的讲究不一样，
+    所以统一从这个函数走，别处（比如 migrate_db.py）建引擎也用它，
+    免得漏掉 pragma 导致外键静默失效。
+    """
+    sqlite = url.startswith("sqlite")
+    kwargs: dict = {
+        "pool_pre_ping": True,      # 连接失效自动重连
+        "echo": False,
+    }
+    if sqlite:
+        # ★ check_same_thread=False 是必须的：AI 整理跑在后台线程里，而 SQLite
+        #   默认禁止一个连接被别的线程用。关掉这个检查后由 SQLAlchemy 的连接池
+        #   保证同一时刻只有一个线程在用某个连接，是安全的。
+        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15}
+    else:
+        kwargs["pool_recycle"] = 3600
 
-    @event.listens_for(engine, "connect")
-    def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - 驱动回调
-        """
-        每次建立 SQLite 连接时设几个 pragma。
+    eng = create_engine(url, **kwargs)
 
-        · foreign_keys=ON —— **SQLite 默认根本不强制外键**。我们的
-          ON DELETE CASCADE / SET NULL 全靠它，不打开等于白写。
-        · journal_mode=WAL —— 读写能并发，后台整理写库时主线程查询不会被卡住。
-        · busy_timeout —— 撞上写锁时等一会儿再报错，而不是立刻 "database is locked"。
-        """
-        cur = dbapi_conn.cursor()
-        cur.execute("PRAGMA foreign_keys=ON")
-        cur.execute("PRAGMA journal_mode=WAL")
-        cur.execute("PRAGMA busy_timeout=15000")
-        cur.close()
+    if sqlite:
+
+        @event.listens_for(eng, "connect")
+        def _sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - 驱动回调
+            """
+            每次建立 SQLite 连接时设几个 pragma。
+
+            · foreign_keys=ON —— **SQLite 默认根本不强制外键**。我们的
+              ON DELETE CASCADE / SET NULL 全靠它，不打开等于白写。
+            · journal_mode=WAL —— 读写能并发，后台整理写库时主线程查询不会被卡住。
+            · busy_timeout —— 撞上写锁时等一会儿再报错，而不是立刻 "database is locked"。
+            """
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=15000")
+            cur.close()
+
+    return eng
+
+
+engine = make_engine(DATABASE_URL)
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -122,7 +136,7 @@ _FKS: dict[str, list[tuple[str, list[str], str, str]]] = {
 }
 
 
-def _migrate() -> None:
+def _migrate(target_engine=None) -> None:
     """
     给**已存在**的表补新列 / 新索引 / 新外键。
 
@@ -131,38 +145,43 @@ def _migrate() -> None:
 
     全新安装时这些其实全是空转：create_all() 按当前模型建出来的表本来就齐全。
     迁移真正起作用的对象是**老版本的库**。
+
+    target_engine: 要迁移哪个库。默认是本程序连的那个；
+        传进来是为了让 migrate_db.py 也能给**另一个**库建结构。
     """
-    existing_tables = set(inspect(engine).get_table_names())
+    eng = target_engine if target_engine is not None else engine
+    sqlite = eng.dialect.name == "sqlite"
+    existing_tables = set(inspect(eng).get_table_names())
 
     for table, columns in _MIGRATIONS.items():
         if table not in existing_tables:
             continue                    # 表都还没有，create_all() 会按新结构建出来
-        have = {c["name"] for c in inspect(engine).get_columns(table)}
+        have = {c["name"] for c in inspect(eng).get_columns(table)}
         for name, ddl in columns:
             if name in have:
                 continue
-            with engine.begin() as conn:
+            with eng.begin() as conn:
                 conn.execute(text(ddl))
             print(f"[db] 迁移：{table} 表已补上 {name} 列")
 
     for table, indexes in _INDEXES.items():
         if table not in existing_tables:
             continue
-        existing = inspect(engine).get_indexes(table)
+        existing = inspect(eng).get_indexes(table)
         have_names = {i["name"] for i in existing}
         have_cols = {tuple(i.get("column_names") or ()) for i in existing}
         for name, cols, ddl in indexes:
             # 名字对得上，或者已经有个同样列的索引 —— 都算已存在
             if name in have_names or tuple(cols) in have_cols:
                 continue
-            with engine.begin() as conn:
+            with eng.begin() as conn:
                 conn.execute(text(ddl))
             print(f"[db] 迁移：{table} 表已补上 {name} 索引")
 
     for table, fks in _FKS.items():
         if table not in existing_tables:
             continue
-        existing = inspect(engine).get_foreign_keys(table)
+        existing = inspect(eng).get_foreign_keys(table)
         have = {
             (tuple(fk.get("constrained_columns") or ()), fk.get("referred_table"))
             for fk in existing
@@ -170,22 +189,33 @@ def _migrate() -> None:
         for name, cols, referred, ddl in fks:
             if (tuple(cols), referred) in have:
                 continue
-            if IS_SQLITE:
+            if sqlite:
                 # SQLite 不支持 ALTER TABLE ADD CONSTRAINT。
                 # 新建的 SQLite 库在 create_all() 阶段就带上了外键，
                 # 压根走不到这儿；真走到了也没法补，跳过而不是崩掉。
                 print(f"[db] 跳过：SQLite 不支持给已有表补外键（{name}）")
                 continue
-            with engine.begin() as conn:
+            with eng.begin() as conn:
                 conn.execute(text(ddl))
             print(f"[db] 迁移：{table} 表已补上 {name} 外键")
 
 
+def ensure_schema(target_engine=None) -> None:
+    """
+    建表（幂等）+ 迁移旧表。**不预置任何数据。**
+
+    migrate_db.py 用它给目标库建结构 —— 那时还不能预置默认类别，
+    否则迁移过去的数据会和预置的 5 条混在一起。
+    """
+    eng = target_engine if target_engine is not None else engine
+    Base.metadata.create_all(eng)
+    _migrate(eng)
+    print("[db] 建表完成:", ", ".join(inspect(eng).get_table_names()))
+
+
 def init_db() -> None:
-    """建表（幂等）+ 迁移旧表 + 预置默认类别。"""
-    Base.metadata.create_all(engine)
-    _migrate()
-    print("[db] 建表完成:", ", ".join(inspect(engine).get_table_names()))
+    """确保结构就绪 + 预置默认类别（只在库还是空的时候预置）。"""
+    ensure_schema()
 
     with SessionLocal() as db:
         if db.query(Category).count() == 0:
