@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (
 )
 
 from config import __version__
-from db.database import SessionLocal, init_db
+from db.database import SessionLocal, describe, init_db
 from db.models import SessionStatus
 from services import llm as llm_svc
 from services import settings as settings_svc
@@ -637,6 +637,9 @@ def main() -> int:
 
     # ★ 必须尽早装：装在 QApplication 之后、任何界面接信号之前
     _install_exception_guard()
+
+    # 告诉用户数据存在哪儿 —— 打包版没有控制台，但开发时很需要这行
+    print(f"[db] {describe()}")
 
     # ★ 单实例必须在 init_db() 之前 —— 第二个实例不该白连一次数据库
     if signal_existing_instance():

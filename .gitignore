@@ -15,7 +15,14 @@ venv/
 # —— 打包产物 ——
 build/
 dist/
+release/
 *.spec
+
+# —— 数据库文件（SQLite 默认后端；这里面是真实学习记录）——
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
 
 # —— 编辑器 / 系统 ——
 .vscode/
@@ -26,4 +33,3 @@ Thumbs.db
 # —— 日志 / 数据导出 ——
 *.log
 *.sql
-*.sqlite3

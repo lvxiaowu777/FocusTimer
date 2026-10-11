@@ -26,7 +26,7 @@ os.environ.setdefault("CRYPTOGRAPHY_OPENSSL_NO_LEGACY", "1")
 # —— 版本号 ——
 # 语义化版本 MAJOR.MINOR.PATCH：加功能升 MINOR，修 bug 升 PATCH。
 # 打包成 exe 后靠它分辨新旧，也在「设置」窗口里显示。
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 if getattr(sys, "frozen", False):
     # PyInstaller 打包后：__file__ 指向临时解压目录，
@@ -58,7 +58,14 @@ _load_env(CENTRAL_ENV)
 
 
 # —— 数据库 ——
-DATABASE_URL: str = os.environ.get("FOCUS_DATABASE_URL", "")
+# ★ 默认用 SQLite（Python 自带，零安装，就是一个文件）。
+#   这样打包发给别人时对方**不用装 MySQL**，解压双击就能用。
+#   想用 MySQL 就在 .env 里设 FOCUS_DATABASE_URL（见 .env.example）。
+SQLITE_FILE = PROJECT_ROOT / "focus_timer.db"
+DATABASE_URL: str = (
+    os.environ.get("FOCUS_DATABASE_URL", "") or f"sqlite:///{SQLITE_FILE.as_posix()}"
+)
+IS_SQLITE: bool = DATABASE_URL.startswith("sqlite")
 
 # —— AI（整理总结用）——
 # 注意：产品名「DeepSeek-V4.1-Flash」不是 API 参数，模型名是 deepseek-flash。
@@ -186,8 +193,6 @@ def ai_config_source() -> str:
 def check() -> list[str]:
     """自检，返回问题列表（空列表 = 一切正常）。"""
     problems = []
-    if not DATABASE_URL:
-        problems.append("FOCUS_DATABASE_URL 未配置（见项目 .env）")
     if not ai_settings()[1]:
         problems.append(
             "AI 的 API Key 未配置 —— 打开「设置 → AI」填一个，"
@@ -204,7 +209,11 @@ if __name__ == "__main__":
             print("  -", i)
     else:
         print("配置正常")
-    print("  数据库:", DATABASE_URL.split("@")[-1])
+    if IS_SQLITE:
+        exists = "已存在" if SQLITE_FILE.exists() else "还不存在，首次运行会自动建"
+        print(f"  数据库: SQLite → {SQLITE_FILE}（{exists}）")
+    else:
+        print("  数据库:", DATABASE_URL.split("@")[-1], "（MySQL）")
     base, key, model = ai_settings()
     print(f"  AI    : {model} @ {base}")
     print(f"  Key   : {'已配置' if key else '未配置'}（来源：{ai_config_source()}）")
